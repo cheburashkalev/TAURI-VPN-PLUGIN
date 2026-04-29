@@ -1,0 +1,32 @@
+{
+  "name": "tauri-plugin-vpn",
+  "version": "0.1.0",
+  "description": "Tauri 2 VPN plugin guest API",
+  "type": "module",
+  "types": "guest-js/index.ts",
+  "main": "guest-js/index.ts",
+  "module": "guest-js/index.ts",
+  "exports": {
+    ".": {
+      "types": "./guest-js/index.ts",
+      "import": "./guest-js/index.ts",
+      "default": "./guest-js/index.ts"
+    }
+  },
+  "files": [
+    "guest-js",
+    "permissions",
+    "android",
+    "ios"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.10.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  }
+}

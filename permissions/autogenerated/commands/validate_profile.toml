@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-validate-profile"
+description = "Enables the validate_profile command without any pre-configured scope."
+commands.allow = ["validate_profile"]
+
+[[permission]]
+identifier = "deny-validate-profile"
+description = "Denies the validate_profile command without any pre-configured scope."
+commands.deny = ["validate_profile"]

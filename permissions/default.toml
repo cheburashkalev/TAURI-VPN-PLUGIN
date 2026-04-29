@@ -1,0 +1,10 @@
+[default]
+description = "Default permissions for the VPN plugin"
+permissions = [
+  "allow-connect",
+  "allow-disconnect",
+  "allow-status",
+  "allow-import-server",
+  "allow-validate-profile",
+  "allow-list-protocols"
+]

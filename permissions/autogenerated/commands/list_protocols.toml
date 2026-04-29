@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-list-protocols"
+description = "Enables the list_protocols command without any pre-configured scope."
+commands.allow = ["list_protocols"]
+
+[[permission]]
+identifier = "deny-list-protocols"
+description = "Denies the list_protocols command without any pre-configured scope."
+commands.deny = ["list_protocols"]

@@ -1,0 +1,39 @@
+[package]
+name = "tauri-plugin-vpn"
+version = "0.1.0"
+edition = "2021"
+authors = ["Andrei Levchenko"]
+license = "Apache-2.0"
+links = "tauri-plugin-vpn"
+description = "A modular Tauri 2 VPN plugin with sing-box based protocol adapters."
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+base64 = "0.22"
+dirs = "6"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = "2.10.3"
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "process", "sync", "time"] }
+url = "2"
+uuid = { version = "1", features = ["serde", "v4"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_System_Threading"
+] }
+
+[build-dependencies]
+tauri-plugin = { version = "2.5.1", features = ["build"] }
+
+[dev-dependencies]
+tempfile = "3"
