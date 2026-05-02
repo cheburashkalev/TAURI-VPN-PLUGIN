@@ -5,7 +5,8 @@
 
 use crate::{
     config,
-    models::{ConnectOptions, TrafficStats},
+    models::{ConnectOptions, TrafficStats, VpnProtocol},
+    olcrtc::{self, OlcRtcRuntime},
     platform, Result, VpnError,
 };
 use serde::Deserialize;
@@ -23,6 +24,7 @@ use tokio::{
 
 pub struct SingBoxEngine {
     child: Mutex<Option<Child>>,
+    olcrtc: Mutex<Option<OlcRtcRuntime>>,
     #[cfg(any(target_os = "android", target_os = "ios"))]
     mobile_connected: Mutex<bool>,
     stats_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
@@ -32,6 +34,7 @@ impl Default for SingBoxEngine {
     fn default() -> Self {
         Self {
             child: Mutex::new(None),
+            olcrtc: Mutex::new(None),
             #[cfg(any(target_os = "android", target_os = "ios"))]
             mobile_connected: Mutex::new(false),
             stats_task: Mutex::new(None),
@@ -77,9 +80,20 @@ impl SingBoxEngine {
         let binary = resolve_core_binary(app)?;
 
         check_config(&binary, &config_path).await?;
+        cleanup_desktop_artifacts(&config_path).await?;
+
+        let mut olcrtc_runtime = if matches!(options.profile.protocol, VpnProtocol::OlcRtc) {
+            let runtime =
+                OlcRtcRuntime::start(olcrtc::OlcRtcConfig::from_profile(&options.profile)?).await?;
+            let _ = app.emit("vpn:log", "OLC RTC client connected to WB Stream");
+            Some(runtime)
+        } else {
+            None
+        };
 
         let mut command = Command::new(&binary);
         command.arg("run").arg("-c").arg(&config_path);
+        command.kill_on_drop(true);
         command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -93,11 +107,15 @@ impl SingBoxEngine {
                 if let Some(status) = child.try_wait().map_err(|error| {
                     VpnError::Engine(format!("failed to inspect sing-box process: {error}"))
                 })? {
+                    if let Some(runtime) = olcrtc_runtime.take() {
+                        runtime.stop().await;
+                    }
                     return Err(VpnError::Engine(format!(
                         "sing-box exited during startup with status {status}. Check vpn logs for details."
                     )));
                 }
                 *guard = Some(child);
+                *self.olcrtc.lock().await = olcrtc_runtime;
                 self.start_stats_polling(app).await;
                 let _ = app.emit(
                     "vpn:log",
@@ -105,10 +123,15 @@ impl SingBoxEngine {
                 );
                 Ok(warnings)
             }
-            Err(error) => Err(VpnError::Engine(format!(
-                "failed to start bundled sing-box core at {}: {error}",
-                binary.display()
-            ))),
+            Err(error) => {
+                if let Some(runtime) = olcrtc_runtime.take() {
+                    runtime.stop().await;
+                }
+                Err(VpnError::Engine(format!(
+                    "failed to start bundled sing-box core at {}: {error}",
+                    binary.display()
+                )))
+            }
         }
     }
 
@@ -119,6 +142,12 @@ impl SingBoxEngine {
         options: &ConnectOptions,
         mobile: Option<&PluginHandle<R>>,
     ) -> Result<Vec<String>> {
+        if matches!(options.profile.protocol, VpnProtocol::OlcRtc) {
+            return Err(VpnError::Unsupported(
+                "OLC RTC mobile support needs a native/Rust WebRTC adapter; Windows desktop is implemented first".into(),
+            ));
+        }
+
         {
             let guard = self.mobile_connected.lock().await;
             if *guard {
@@ -174,13 +203,20 @@ impl SingBoxEngine {
         let mut guard = self.child.lock().await;
         self.stop_stats_polling().await;
         let Some(mut child) = guard.take() else {
+            cleanup_desktop_artifacts(&runtime_config_path(app)?).await?;
             return Err(VpnError::NotRunning);
         };
-        if let Err(error) = child.kill().await {
+        let kill_result = child.kill().await;
+        if let Some(runtime) = self.olcrtc.lock().await.take() {
+            runtime.stop().await;
+        }
+        if let Err(error) = kill_result {
+            let _ = cleanup_desktop_artifacts(&runtime_config_path(app)?).await;
             return Err(VpnError::Engine(format!(
                 "failed to stop sing-box: {error}"
             )));
         }
+        cleanup_desktop_artifacts(&runtime_config_path(app)?).await?;
         let _ = app.emit("vpn:log", "sing-box process stopped");
         Ok(())
     }
@@ -385,14 +421,86 @@ where
 }
 
 fn write_runtime_config<R: Runtime>(app: &AppHandle<R>, config_text: &str) -> Result<PathBuf> {
+    let config_path = runtime_config_path(app)?;
+    if let Some(dir) = config_path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(&config_path, config_text)?;
+    Ok(config_path)
+}
+
+pub(crate) fn runtime_config_path<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf> {
     let dir = app
         .path()
         .app_local_data_dir()
         .map_err(|error| VpnError::Platform(format!("app data directory unavailable: {error}")))?;
-    std::fs::create_dir_all(&dir)?;
-    let config_path = dir.join("sing-box.generated.json");
-    std::fs::write(&config_path, config_text)?;
-    Ok(config_path)
+    Ok(dir.join("sing-box.generated.json"))
+}
+
+#[cfg(target_os = "windows")]
+async fn cleanup_desktop_artifacts(config_path: &Path) -> Result<()> {
+    cleanup_desktop_artifacts_blocking(config_path)?;
+    sleep(Duration::from_millis(300)).await;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn cleanup_desktop_artifacts_blocking(config_path: &Path) -> Result<()> {
+    let config_path = config_path
+        .canonicalize()
+        .unwrap_or_else(|_| config_path.to_path_buf());
+    let status = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            r#"
+$ErrorActionPreference = 'SilentlyContinue'
+$target = [System.IO.Path]::GetFullPath($env:KOSTRA_VPN_CONFIG_PATH)
+Get-CimInstance Win32_Process |
+  Where-Object { $_.Name -ieq 'sing-box.exe' -and $_.CommandLine -and $_.CommandLine.Contains($target) } |
+  ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+
+Start-Sleep -Milliseconds 250
+
+$indices = @{}
+Get-NetIPAddress -AddressFamily IPv4 -IPAddress '172.19.0.1' |
+  ForEach-Object { $indices[$_.InterfaceIndex] = $true }
+Get-NetAdapter |
+  Where-Object { $_.Name -eq 'tun0' -or $_.InterfaceDescription -like '*sing-tun*' } |
+  ForEach-Object { $indices[$_.ifIndex] = $true }
+
+foreach ($index in $indices.Keys) {
+  Get-NetRoute -InterfaceIndex $index | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
+  Get-NetIPAddress -InterfaceIndex $index -AddressFamily IPv4 | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
+  Set-DnsClientServerAddress -InterfaceIndex $index -ResetServerAddresses -ErrorAction SilentlyContinue
+}
+"#,
+        ])
+        .env("KOSTRA_VPN_CONFIG_PATH", config_path)
+        .status()
+        .map_err(|error| {
+            VpnError::Engine(format!("failed to clean up stale Windows TUN state: {error}"))
+        })?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(VpnError::Engine(format!(
+            "Windows TUN cleanup exited with status {status}"
+        )))
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+async fn cleanup_desktop_artifacts(_config_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn cleanup_desktop_artifacts_blocking(_config_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 fn resolve_core_binary<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf> {

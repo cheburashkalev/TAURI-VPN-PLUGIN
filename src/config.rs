@@ -1,6 +1,6 @@
 use crate::{
     models::{ConnectOptions, RouteMode, TransportKind, VpnProfile, VpnProtocol},
-    protocols, Result, VpnError,
+    olcrtc, protocols, Result, VpnError,
 };
 use serde_json::{json, Value};
 
@@ -16,6 +16,7 @@ pub fn generate_sing_box_config(options: &ConnectOptions) -> Result<Value> {
     let route_final = match options.route_mode {
         RouteMode::Global | RouteMode::Rule => "proxy",
     };
+    let route_rules = route_rules_for_profile(&options.profile);
     let tun_stack = if cfg!(any(target_os = "android", target_os = "ios")) {
         "gvisor"
     } else {
@@ -33,7 +34,8 @@ pub fn generate_sing_box_config(options: &ConnectOptions) -> Result<Value> {
                     "type": "udp",
                     "tag": format!("dns-{index}"),
                     "server": server,
-                    "server_port": 53
+                    "server_port": 53,
+                    "detour": "proxy"
                 })
             }).collect::<Vec<_>>(),
             "final": "dns-0"
@@ -60,20 +62,7 @@ pub fn generate_sing_box_config(options: &ConnectOptions) -> Result<Value> {
             { "type": "block", "tag": "block" }
         ],
         "route": {
-            "rules": [
-                {
-                    "action": "sniff"
-                },
-                {
-                    "protocol": "dns",
-                    "action": "hijack-dns"
-                },
-                {
-                    "network": "udp",
-                    "port": 53,
-                    "action": "hijack-dns"
-                }
-            ],
+            "rules": route_rules,
             "auto_detect_interface": true,
             "default_domain_resolver": "dns-0",
             "final": route_final
@@ -84,6 +73,55 @@ pub fn generate_sing_box_config(options: &ConnectOptions) -> Result<Value> {
             }
         }
     }))
+}
+
+fn route_rules_for_profile(profile: &VpnProfile) -> Vec<Value> {
+    let mut rules = vec![
+        json!({
+            "action": "sniff"
+        }),
+        json!({
+            "protocol": "dns",
+            "action": "hijack-dns"
+        }),
+        json!({
+            "network": "udp",
+            "port": 53,
+            "action": "hijack-dns"
+        }),
+    ];
+
+    if matches!(profile.protocol, VpnProtocol::OlcRtc) {
+        rules.extend([
+            json!({
+                "domain": [
+                    "stream.wb.ru",
+                    "wbstream01-el.wb.ru"
+                ],
+                "action": "route",
+                "outbound": "direct"
+            }),
+            json!({
+                "network": ["tcp", "udp"],
+                "port": [3478, 5349],
+                "action": "route",
+                "outbound": "direct"
+            }),
+            json!({
+                "network": "tcp",
+                "port": 7880,
+                "action": "route",
+                "outbound": "direct"
+            }),
+            json!({
+                "network": "udp",
+                "action": "reject",
+                "method": "default"
+            }),
+        ]);
+    }
+
+    rules
 }
 
 fn outbound_for_profile(profile: &VpnProfile) -> Result<Value> {
@@ -174,6 +212,15 @@ fn outbound_for_profile(profile: &VpnProfile) -> Result<Value> {
             "username": profile.auth.username,
             "password": profile.auth.password
         }),
+        VpnProtocol::OlcRtc => {
+            let (server, port) = olcrtc::local_socks_endpoint(profile)?;
+            json!({
+                "type": "socks",
+                "tag": "proxy",
+                "server": server,
+                "server_port": port
+            })
+        }
         VpnProtocol::Tun | VpnProtocol::Mixed => {
             return Err(VpnError::Unsupported(
                 "local inbound mode cannot be used as outbound".into(),

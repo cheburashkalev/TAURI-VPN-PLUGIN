@@ -41,6 +41,7 @@ fn parse_url_profile(input: &str) -> Result<VpnProfile> {
         "tuic" => VpnProtocol::Tuic,
         "socks" | "socks5" => VpnProtocol::Socks,
         "http" | "https" => VpnProtocol::Http,
+        "olcrtc" | "olcrtc+wbstream" | "wbstream" => VpnProtocol::OlcRtc,
         other => return Err(VpnError::Import(format!("unsupported URI scheme {other}"))),
     };
 
@@ -50,10 +51,13 @@ fn parse_url_profile(input: &str) -> Result<VpnProfile> {
             .map(String::from)
             .unwrap_or_else(|| protocol_name(protocol).into())
     });
-    let server = url
-        .host_str()
-        .ok_or_else(|| VpnError::Import("server host is required".into()))?
-        .to_string();
+    let server = if matches!(protocol, VpnProtocol::OlcRtc) {
+        parse_olcrtc_room_id(&url, &query)?
+    } else {
+        url.host_str()
+            .ok_or_else(|| VpnError::Import("server host is required".into()))?
+            .to_string()
+    };
     let port = url.port().unwrap_or(default_port(protocol));
     let credential = url.username().to_string();
     let password = url.password().map(String::from);
@@ -83,6 +87,16 @@ fn parse_url_profile(input: &str) -> Result<VpnProfile> {
             } else {
                 Some(percent_decode(&credential))
             },
+        },
+        VpnProtocol::OlcRtc => AuthOptions {
+            uuid: None,
+            password: query
+                .get("key")
+                .cloned()
+                .or(password)
+                .or_else(|| (!credential.is_empty()).then(|| percent_decode(&credential))),
+            method: None,
+            username: None,
         },
         _ => AuthOptions {
             uuid: None,
@@ -314,6 +328,7 @@ fn protocol_name(protocol: VpnProtocol) -> &'static str {
         VpnProtocol::Mixed => "Mixed",
         VpnProtocol::Socks => "SOCKS",
         VpnProtocol::Http => "HTTP",
+        VpnProtocol::OlcRtc => "OLC RTC",
     }
 }
 
@@ -322,6 +337,27 @@ fn default_port(protocol: VpnProtocol) -> u16 {
         VpnProtocol::Shadowsocks => 8388,
         VpnProtocol::Socks => 1080,
         VpnProtocol::Http => 8080,
+        VpnProtocol::OlcRtc => 443,
         _ => 443,
     }
+}
+
+fn parse_olcrtc_room_id(url: &Url, query: &BTreeMap<String, String>) -> Result<String> {
+    if let Some(room_id) = query.get("roomId").filter(|value| !value.trim().is_empty()) {
+        return Ok(room_id.clone());
+    }
+
+    let host = url.host_str().unwrap_or_default();
+    let path = url.path().trim_start_matches('/');
+    let room_id = if matches!(host, "wb_stream" | "wbstream") && !path.is_empty() {
+        path
+    } else {
+        host
+    };
+
+    if room_id.trim().is_empty() {
+        return Err(VpnError::Import("OLC RTC room id is required".into()));
+    }
+
+    Ok(room_id.into())
 }

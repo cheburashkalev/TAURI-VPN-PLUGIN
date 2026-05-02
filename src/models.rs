@@ -51,6 +51,7 @@ pub enum VpnProtocol {
     Mixed,
     Socks,
     Http,
+    OlcRtc,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

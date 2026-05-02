@@ -10,6 +10,43 @@ Trojan, Shadowsocks, WireGuard, Hysteria, Hysteria2, TUIC, SOCKS, HTTP, Mixed,
 and TUN. The default runtime adapter is sing-box so new protocol adapters can be
 added without changing the Tauri command API.
 
+OLC RTC client support is integrated as an additional desktop adapter for
+`stream.wb.ru`/WB Stream. The plugin starts a Rust local SOCKS5 client, connects
+to the WB Stream LiveKit room, and points sing-box at that local SOCKS endpoint.
+Import format:
+
+```text
+olcrtc://<room-id>?key=<64-hex-character-shared-key>&localPort=10808#WB Stream
+```
+
+Only the client side is implemented here; the olcrtc server-side TCP dialer is
+not embedded into the plugin.
+
+To start a compatible server, run the upstream `olcrtc` server with the
+`wb_stream` provider:
+
+```bash
+git clone https://github.com/openlibrecommunity/olcrtc.git
+cd olcrtc
+./script/srv.sh
+```
+
+Choose provider `3) wb_stream`, then copy the emitted `Room ID` and
+`Encryption key` into the app import URI. The equivalent manual command is:
+
+```bash
+./olcrtc -mode srv -provider wb_stream -id <room-id-or-any> -key <64-hex-character-shared-key>
+```
+
+In KOSTRA-VPN, import:
+
+```text
+olcrtc://<room-id>?key=<64-hex-character-shared-key>&localPort=10808#WB Stream
+```
+
+The plugin will bind the local OLC RTC client on `127.0.0.1:<localPort>` and
+generate a sing-box SOCKS outbound that points to that local endpoint.
+
 Desktop builds must package a `sing-box` binary as a Tauri resource. iOS builds
 require Apple Developer NetworkExtension entitlements and a Packet Tunnel target.
 

@@ -22,6 +22,11 @@ pub fn list_protocols() -> Vec<ProtocolInfo> {
         (VpnProtocol::Mixed, "Mixed", vec![]),
         (VpnProtocol::Socks, "SOCKS", vec!["socks", "socks5"]),
         (VpnProtocol::Http, "HTTP", vec!["http", "https"]),
+        (
+            VpnProtocol::OlcRtc,
+            "OLC RTC",
+            vec!["olcrtc", "olcrtc+wbstream", "wbstream"],
+        ),
     ]
     .into_iter()
     .map(|(protocol, display_name, uri_schemes)| ProtocolInfo {
@@ -100,6 +105,30 @@ pub fn validate(profile: &VpnProfile) -> ValidationResult {
                 "SOCKS/HTTP are proxy protocols and may not provide full VPN semantics".into(),
             );
         }
+        VpnProtocol::OlcRtc => {
+            if profile
+                .auth
+                .password
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty()
+            {
+                errors.push("OLC RTC shared key is required".into());
+            }
+            if let Some(key) = profile.auth.password.as_deref() {
+                if key.len() != 64 || !key.chars().all(|ch| ch.is_ascii_hexdigit()) {
+                    errors.push("OLC RTC shared key must be a 32-byte hex string".into());
+                }
+            }
+            let provider = profile
+                .extra
+                .get("provider")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("wb_stream");
+            if provider != "wb_stream" {
+                errors.push("only OLC RTC wb_stream provider is supported".into());
+            }
+        }
     }
 
     if profile.reality.is_some() && !matches!(profile.protocol, VpnProtocol::Vless) {
@@ -107,6 +136,11 @@ pub fn validate(profile: &VpnProfile) -> ValidationResult {
     }
     if matches!(profile.transport.kind, TransportKind::Xhttp) {
         warnings.push("XHTTP compatibility depends on the bundled sing-box version".into());
+    }
+    if matches!(profile.protocol, VpnProtocol::OlcRtc) {
+        warnings.push(
+            "OLC RTC starts a local SOCKS5 client and routes sing-box through stream.wb.ru".into(),
+        );
     }
 
     ValidationResult {

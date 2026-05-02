@@ -4,6 +4,7 @@ mod engine;
 mod errors;
 pub mod import;
 pub mod models;
+mod olcrtc;
 mod platform;
 mod protocols;
 mod state;
@@ -14,7 +15,7 @@ pub use models::*;
 use state::VpnState;
 use tauri::{
     plugin::{Builder, TauriPlugin},
-    Manager, Runtime,
+    Manager, RunEvent, Runtime,
 };
 
 #[cfg(target_os = "ios")]
@@ -44,6 +45,13 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
 
             app.manage(VpnState::new(SingBoxEngine::default(), mobile));
             Ok(())
+        })
+        .on_event(|app, event| {
+            if matches!(event, RunEvent::ExitRequested { .. } | RunEvent::Exit) {
+                if let Ok(config_path) = engine::runtime_config_path(app) {
+                    let _ = engine::cleanup_desktop_artifacts_blocking(&config_path);
+                }
+            }
         })
         .build()
 }

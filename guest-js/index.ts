@@ -12,7 +12,8 @@ export type VpnProtocol =
   | "tun"
   | "mixed"
   | "socks"
-  | "http";
+  | "http"
+  | "olc-rtc";
 
 export type TransportKind = "tcp" | "web-socket" | "grpc" | "http-upgrade" | "xhttp" | "quic";
 export type RouteMode = "global" | "rule";

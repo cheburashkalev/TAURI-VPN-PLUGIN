@@ -54,3 +54,48 @@ fn generates_sing_box_config() {
     assert_eq!(config["outbounds"][0]["type"], "vless");
     assert_eq!(config["inbounds"][0]["type"], "tun");
 }
+
+#[test]
+fn imports_olcrtc_wbstream_uri() {
+    let imported = import_server("olcrtc://room-123?key=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f&localPort=18080#WB").unwrap();
+    assert_eq!(
+        imported.profile.protocol,
+        tauri_plugin_vpn::models::VpnProtocol::OlcRtc
+    );
+    assert_eq!(imported.profile.name, "WB");
+    assert_eq!(imported.profile.server, "room-123");
+    assert_eq!(
+        imported.profile.auth.password.as_deref(),
+        Some("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+    );
+}
+
+#[test]
+fn generates_olcrtc_sing_box_socks_outbound() {
+    let config = generate_sing_box_config(&options("olcrtc://room-123?key=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f&localPort=18080#WB")).unwrap();
+    assert_eq!(config["outbounds"][0]["type"], "socks");
+    assert_eq!(config["outbounds"][0]["server"], "127.0.0.1");
+    assert_eq!(config["outbounds"][0]["server_port"], 18080);
+}
+
+#[test]
+fn generates_olcrtc_transport_bypass_rules() {
+    let config = generate_sing_box_config(&options("olcrtc://room-123?key=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f&localPort=18080#WB")).unwrap();
+    let rules = config["route"]["rules"].as_array().unwrap();
+
+    assert!(rules.iter().any(|rule| {
+        rule["outbound"] == "direct"
+            && rule["domain"]
+                .as_array()
+                .is_some_and(|domains| domains.iter().any(|domain| domain == "stream.wb.ru"))
+    }));
+    assert!(rules.iter().any(|rule| {
+        rule["outbound"] == "direct"
+            && rule["port"]
+                .as_array()
+                .is_some_and(|ports| ports.iter().any(|port| port == 3478))
+    }));
+    assert!(rules
+        .iter()
+        .any(|rule| rule["network"] == "udp" && rule["action"] == "reject"));
+}
