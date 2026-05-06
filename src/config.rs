@@ -31,7 +31,7 @@ pub fn generate_sing_box_config(options: &ConnectOptions) -> Result<Value> {
         "dns": {
             "servers": options.dns.servers.iter().enumerate().map(|(index, server)| {
                 json!({
-                    "type": "udp",
+                    "type": "tcp",
                     "tag": format!("dns-{index}"),
                     "server": server,
                     "server_port": 53,

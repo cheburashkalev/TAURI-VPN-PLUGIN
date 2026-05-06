@@ -22,6 +22,9 @@ use tokio::{
     time::{sleep, Duration},
 };
 
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
 pub struct SingBoxEngine {
     child: Mutex<Option<Child>>,
     olcrtc: Mutex<Option<OlcRtcRuntime>>,
@@ -94,6 +97,7 @@ impl SingBoxEngine {
         let mut command = Command::new(&binary);
         command.arg("run").arg("-c").arg(&config_path);
         command.kill_on_drop(true);
+        hide_tokio_command_window(&mut command);
         command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -110,6 +114,7 @@ impl SingBoxEngine {
                     if let Some(runtime) = olcrtc_runtime.take() {
                         runtime.stop().await;
                     }
+                    let _ = cleanup_desktop_artifacts(&config_path).await;
                     return Err(VpnError::Engine(format!(
                         "sing-box exited during startup with status {status}. Check vpn logs for details."
                     )));
@@ -368,10 +373,10 @@ struct ConnectionsStats {
 }
 
 async fn check_config(binary: &Path, config_path: &Path) -> Result<()> {
-    let output = Command::new(binary)
-        .arg("check")
-        .arg("-c")
-        .arg(config_path)
+    let mut command = Command::new(binary);
+    command.arg("check").arg("-c").arg(config_path);
+    hide_tokio_command_window(&mut command);
+    let output = command
         .output()
         .await
         .map_err(|error| {
@@ -449,18 +454,26 @@ pub(crate) fn cleanup_desktop_artifacts_blocking(config_path: &Path) -> Result<(
     let config_path = config_path
         .canonicalize()
         .unwrap_or_else(|_| config_path.to_path_buf());
-    let status = std::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            r#"
+    let mut command = std::process::Command::new("powershell");
+    command.args([
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        r#"
 $ErrorActionPreference = 'SilentlyContinue'
 $target = [System.IO.Path]::GetFullPath($env:KOSTRA_VPN_CONFIG_PATH)
 Get-CimInstance Win32_Process |
   Where-Object { $_.Name -ieq 'sing-box.exe' -and $_.CommandLine -and $_.CommandLine.Contains($target) } |
   ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+
+Get-NetTCPConnection -LocalAddress '127.0.0.1' -LocalPort 2080 -State Listen |
+  ForEach-Object {
+    $process = Get-CimInstance Win32_Process -Filter "ProcessId=$($_.OwningProcess)"
+    if ($process -and $process.Name -ieq 'sing-box.exe') {
+      Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue
+    }
+  }
 
 Start-Sleep -Milliseconds 250
 
@@ -468,17 +481,23 @@ $indices = @{}
 Get-NetIPAddress -AddressFamily IPv4 -IPAddress '172.19.0.1' |
   ForEach-Object { $indices[$_.InterfaceIndex] = $true }
 Get-NetAdapter |
-  Where-Object { $_.Name -eq 'tun0' -or $_.InterfaceDescription -like '*sing-tun*' } |
+  Where-Object { $_.Name -like 'tun*' -or $_.InterfaceDescription -like '*sing-tun*' } |
   ForEach-Object { $indices[$_.ifIndex] = $true }
 
 foreach ($index in $indices.Keys) {
   Get-NetRoute -InterfaceIndex $index | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
-  Get-NetIPAddress -InterfaceIndex $index -AddressFamily IPv4 | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
+  Get-NetIPAddress -InterfaceIndex $index | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
   Set-DnsClientServerAddress -InterfaceIndex $index -ResetServerAddresses -ErrorAction SilentlyContinue
 }
 "#,
-        ])
+    ]);
+    command
         .env("KOSTRA_VPN_CONFIG_PATH", config_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    hide_std_command_window(&mut command);
+    let status = command
         .status()
         .map_err(|error| {
             VpnError::Engine(format!("failed to clean up stale Windows TUN state: {error}"))
@@ -503,6 +522,23 @@ pub(crate) fn cleanup_desktop_artifacts_blocking(_config_path: &Path) -> Result<
     Ok(())
 }
 
+#[cfg(target_os = "windows")]
+fn hide_tokio_command_window(command: &mut Command) {
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(target_os = "windows"))]
+fn hide_tokio_command_window(_command: &mut Command) {}
+
+#[cfg(target_os = "windows")]
+fn hide_std_command_window(command: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(target_os = "windows"))]
+fn hide_std_command_window(_command: &mut std::process::Command) {}
+
 fn resolve_core_binary<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf> {
     let core_name = platform::default_core_name();
     let mut candidates = vec![
@@ -516,9 +552,19 @@ fn resolve_core_binary<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf> {
                 tauri::path::BaseDirectory::Resource,
             )
             .ok(),
+        app.path()
+            .resolve(
+                Path::new("_up_").join("resources").join(core_name),
+                tauri::path::BaseDirectory::Resource,
+            )
+            .ok(),
         std::env::current_exe().ok().and_then(|path| {
             path.parent()
                 .map(|dir| dir.join("resources").join(core_name))
+        }),
+        std::env::current_exe().ok().and_then(|path| {
+            path.parent()
+                .map(|dir| dir.join("_up_").join("resources").join(core_name))
         }),
         std::env::current_dir()
             .ok()
