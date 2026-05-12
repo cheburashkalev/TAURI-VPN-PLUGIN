@@ -118,7 +118,24 @@ class VpnPlugin(private val activity: Activity) : Plugin(activity) {
         val intent = Intent(activity, KostraVpnService::class.java)
         intent.action = KostraVpnService.ACTION_STOP
         activity.startService(intent)
-        invoke.resolve(JSObject().put("stopped", true))
+
+        Thread {
+            val deadline = SystemClock.elapsedRealtime() + 5_000
+            while (SystemClock.elapsedRealtime() < deadline) {
+                if (!KostraVpnService.isTunEstablished()) {
+                    activity.runOnUiThread {
+                        invoke.resolve(JSObject().put("stopped", true))
+                    }
+                    return@Thread
+                }
+
+                Thread.sleep(100)
+            }
+
+            activity.runOnUiThread {
+                invoke.resolve(JSObject().put("stopped", true))
+            }
+        }.start()
     }
 
     @Command

@@ -5,6 +5,21 @@ use crate::{
 use serde_json::{json, Value};
 
 pub const CLASH_API_ADDR: &str = "127.0.0.1:19090";
+const LOCAL_NETWORK_CIDRS: &[&str] = &[
+    "0.0.0.0/8",
+    "10.0.0.0/8",
+    "100.64.0.0/10",
+    "127.0.0.0/8",
+    "169.254.0.0/16",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "224.0.0.0/4",
+    "255.255.255.255/32",
+    "::1/128",
+    "fc00::/7",
+    "fe80::/10",
+    "ff00::/8",
+];
 
 pub fn generate_sing_box_config(options: &ConnectOptions) -> Result<Value> {
     let validation = protocols::validate(&options.profile);
@@ -22,6 +37,7 @@ pub fn generate_sing_box_config(options: &ConnectOptions) -> Result<Value> {
     } else {
         "mixed"
     };
+    let dns_servers = dns_servers_for_options(options);
 
     Ok(json!({
         "log": {
@@ -29,22 +45,15 @@ pub fn generate_sing_box_config(options: &ConnectOptions) -> Result<Value> {
             "timestamp": true
         },
         "dns": {
-            "servers": options.dns.servers.iter().enumerate().map(|(index, server)| {
-                json!({
-                    "type": "tcp",
-                    "tag": format!("dns-{index}"),
-                    "server": server,
-                    "server_port": 53,
-                    "detour": "proxy"
-                })
-            }).collect::<Vec<_>>(),
+            "servers": dns_servers,
             "final": "dns-0"
         },
         "inbounds": [
             {
                 "type": "tun",
                 "tag": "tun-in",
-                "address": ["172.19.0.1/30"],
+                "address": ["198.18.0.1/30"],
+                "route_exclude_address": LOCAL_NETWORK_CIDRS,
                 "auto_route": true,
                 "strict_route": options.kill_switch,
                 "stack": tun_stack
@@ -64,7 +73,7 @@ pub fn generate_sing_box_config(options: &ConnectOptions) -> Result<Value> {
         "route": {
             "rules": route_rules,
             "auto_detect_interface": true,
-            "default_domain_resolver": "dns-0",
+            "default_domain_resolver": "dns-bootstrap",
             "final": route_final
         },
         "experimental": {
@@ -73,6 +82,37 @@ pub fn generate_sing_box_config(options: &ConnectOptions) -> Result<Value> {
             }
         }
     }))
+}
+
+fn dns_servers_for_options(options: &ConnectOptions) -> Vec<Value> {
+    let upstreams = if options.dns.servers.is_empty() {
+        vec!["1.1.1.1".to_string()]
+    } else {
+        options.dns.servers.clone()
+    };
+    let bootstrap = upstreams
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "1.1.1.1".to_string());
+
+    let mut servers = vec![json!({
+        "type": "tcp",
+        "tag": "dns-bootstrap",
+        "server": bootstrap,
+        "server_port": 53
+    })];
+
+    servers.extend(upstreams.iter().enumerate().map(|(index, server)| {
+        json!({
+            "type": "tcp",
+            "tag": format!("dns-{index}"),
+            "server": server,
+            "server_port": 53,
+            "detour": "proxy"
+        })
+    }));
+
+    servers
 }
 
 fn route_rules_for_profile(profile: &VpnProfile) -> Vec<Value> {
@@ -88,6 +128,11 @@ fn route_rules_for_profile(profile: &VpnProfile) -> Vec<Value> {
             "network": "udp",
             "port": 53,
             "action": "hijack-dns"
+        }),
+        json!({
+            "ip_cidr": LOCAL_NETWORK_CIDRS,
+            "action": "route",
+            "outbound": "direct"
         }),
     ];
 
