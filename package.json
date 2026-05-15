@@ -1,6 +1,6 @@
 {
   "name": "tauri-plugin-vpn",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Tauri 2 VPN plugin guest API",
   "type": "module",
   "types": "guest-js/index.ts",
