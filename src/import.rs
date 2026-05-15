@@ -268,6 +268,7 @@ fn parse_tls(query: &BTreeMap<String, String>) -> Option<TlsOptions> {
             .unwrap_or_default(),
         insecure: query
             .get("allowInsecure")
+            .or_else(|| query.get("insecure"))
             .is_some_and(|value| value == "1" || value == "true"),
         fingerprint: query.get("fp").cloned(),
     })

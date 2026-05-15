@@ -17,13 +17,25 @@ use std::{
 use tauri::{plugin::PluginHandle, AppHandle, Emitter, Manager, Runtime};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    net::TcpStream,
     process::{Child, Command},
     sync::Mutex,
-    time::{sleep, Duration},
+    time::{sleep, timeout, Duration},
 };
 
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+const CONFIG_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
+const DESKTOP_STOP_TIMEOUT: Duration = Duration::from_secs(8);
+const DESKTOP_STATS_TIMEOUT: Duration = Duration::from_secs(3);
+const PORT_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+#[cfg(any(target_os = "android", target_os = "ios"))]
+const MOBILE_START_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(any(target_os = "android", target_os = "ios"))]
+const MOBILE_STOP_TIMEOUT: Duration = Duration::from_secs(8);
+#[cfg(target_os = "android")]
+const MOBILE_STATS_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub struct SingBoxEngine {
     child: Mutex<Option<Child>>,
@@ -107,10 +119,7 @@ impl SingBoxEngine {
             Ok(mut child) => {
                 pipe_logs(app, child.stdout.take(), "stdout");
                 pipe_logs(app, child.stderr.take(), "stderr");
-                sleep(Duration::from_millis(1200)).await;
-                if let Some(status) = child.try_wait().map_err(|error| {
-                    VpnError::Engine(format!("failed to inspect sing-box process: {error}"))
-                })? {
+                if let Some(status) = wait_for_desktop_readiness(&mut child).await? {
                     if let Some(runtime) = olcrtc_runtime.take() {
                         runtime.stop().await;
                     }
@@ -171,12 +180,15 @@ impl SingBoxEngine {
             ));
         };
 
-        mobile
-            .run_mobile_plugin_async::<NativeStartResponse>(
+        timeout(
+            MOBILE_START_TIMEOUT,
+            mobile.run_mobile_plugin_async::<NativeStartResponse>(
                 "startNativeVpn",
                 NativeConnectArgs { config_json },
-            )
-            .await
+            ),
+        )
+        .await
+        .map_err(|_| VpnError::Platform("native VPN start timed out".into()))?
             .map_err(|error| VpnError::Platform(format!("native VPN start failed: {error}")))?;
 
         *self.mobile_connected.lock().await = true;
@@ -211,7 +223,9 @@ impl SingBoxEngine {
             cleanup_desktop_artifacts(&runtime_config_path(app)?).await?;
             return Err(VpnError::NotRunning);
         };
-        let kill_result = child.kill().await;
+        let kill_result = timeout(DESKTOP_STOP_TIMEOUT, child.kill())
+            .await
+            .map_err(|_| VpnError::Engine("timed out while stopping sing-box".into()))?;
         if let Some(runtime) = self.olcrtc.lock().await.take() {
             runtime.stop().await;
         }
@@ -243,9 +257,12 @@ impl SingBoxEngine {
             ));
         };
 
-        mobile
-            .run_mobile_plugin_async::<NativeStopResponse>("stopNativeVpn", ())
-            .await
+        timeout(
+            MOBILE_STOP_TIMEOUT,
+            mobile.run_mobile_plugin_async::<NativeStopResponse>("stopNativeVpn", ()),
+        )
+        .await
+        .map_err(|_| VpnError::Platform("native VPN stop timed out".into()))?
             .map_err(|error| VpnError::Platform(format!("native VPN stop failed: {error}")))?;
 
         self.stop_stats_polling().await;
@@ -262,7 +279,10 @@ impl SingBoxEngine {
 
         let app = app.clone();
         *guard = Some(tauri::async_runtime::spawn(async move {
-            let client = reqwest::Client::new();
+            let client = reqwest::Client::builder()
+                .timeout(DESKTOP_STATS_TIMEOUT)
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new());
             let url = format!("http://{}/connections", config::CLASH_API_ADDR);
 
             loop {
@@ -313,22 +333,30 @@ impl SingBoxEngine {
         *guard = Some(tauri::async_runtime::spawn(async move {
             loop {
                 sleep(Duration::from_secs(1)).await;
-                match mobile
-                    .run_mobile_plugin_async::<NativeTrafficStats>("getNativeTrafficStats", ())
-                    .await
+                match timeout(
+                    MOBILE_STATS_TIMEOUT,
+                    mobile.run_mobile_plugin_async::<NativeTrafficStats>(
+                        "getNativeTrafficStats",
+                        (),
+                    ),
+                )
+                .await
                 {
-                    Ok(stats) => {
+                    Ok(Ok(stats)) => {
                         let traffic = TrafficStats {
                             uploaded_bytes: stats.uploaded_bytes,
                             downloaded_bytes: stats.downloaded_bytes,
                         };
                         let _ = app.emit("vpn:stats", traffic);
                     }
-                    Err(error) => {
+                    Ok(Err(error)) => {
                         let _ = app.emit(
                             "vpn:log",
                             format!("failed to query Android traffic stats: {error}"),
                         );
+                    }
+                    Err(_) => {
+                        let _ = app.emit("vpn:log", "Android traffic stats query timed out");
                     }
                 }
             }
@@ -376,9 +404,9 @@ async fn check_config(binary: &Path, config_path: &Path) -> Result<()> {
     let mut command = Command::new(binary);
     command.arg("check").arg("-c").arg(config_path);
     hide_tokio_command_window(&mut command);
-    let output = command
-        .output()
+    let output = timeout(CONFIG_CHECK_TIMEOUT, command.output())
         .await
+        .map_err(|_| VpnError::Engine("sing-box config check timed out".into()))?
         .map_err(|error| {
             VpnError::Engine(format!(
                 "failed to run sing-box config check at {}: {error}",
@@ -397,6 +425,46 @@ async fn check_config(binary: &Path, config_path: &Path) -> Result<()> {
         stdout.trim(),
         stderr.trim()
     )))
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+async fn wait_for_desktop_readiness(child: &mut Child) -> Result<Option<std::process::ExitStatus>> {
+    for _ in 0..20 {
+        if let Some(status) = child.try_wait().map_err(|error| {
+            VpnError::Engine(format!("failed to inspect sing-box process: {error}"))
+        })? {
+            return Ok(Some(status));
+        }
+
+        if tcp_connects("127.0.0.1:2080").await
+            || tcp_connects(config::CLASH_API_ADDR).await
+        {
+            sleep(Duration::from_millis(700)).await;
+            if let Some(status) = child.try_wait().map_err(|error| {
+                VpnError::Engine(format!("failed to inspect sing-box process: {error}"))
+            })? {
+                return Ok(Some(status));
+            }
+            return Ok(None);
+        }
+
+        sleep(Duration::from_millis(300)).await;
+    }
+
+    if let Some(status) = child.try_wait().map_err(|error| {
+        VpnError::Engine(format!("failed to inspect sing-box process: {error}"))
+    })? {
+        return Ok(Some(status));
+    }
+
+    Err(VpnError::Engine(
+        "sing-box did not open local proxy ports during startup".into(),
+    ))
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+async fn tcp_connects(addr: &str) -> bool {
+    matches!(timeout(PORT_PROBE_TIMEOUT, TcpStream::connect(addr)).await, Ok(Ok(_)))
 }
 
 fn pipe_logs<R, T>(app: &AppHandle<R>, stream: Option<T>, label: &'static str)

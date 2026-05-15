@@ -56,6 +56,21 @@ fn generates_sing_box_config() {
 }
 
 #[test]
+fn generates_doh_dns_for_public_resolvers() {
+    let config = generate_sing_box_config(&options("vless://11111111-1111-1111-1111-111111111111@example.com:443?security=tls&sni=example.com#Node")).unwrap();
+    let servers = config["dns"]["servers"].as_array().unwrap();
+    let cloudflare = servers.iter().find(|server| server["tag"] == "dns-0").unwrap();
+    let google = servers.iter().find(|server| server["tag"] == "dns-1").unwrap();
+
+    assert_eq!(cloudflare["type"], "https");
+    assert_eq!(cloudflare["server"], "1.1.1.1");
+    assert_eq!(cloudflare["detour"], "proxy");
+    assert_eq!(cloudflare["tls"]["server_name"], "cloudflare-dns.com");
+    assert_eq!(google["type"], "https");
+    assert_eq!(google["tls"]["server_name"], "dns.google");
+}
+
+#[test]
 fn imports_olcrtc_wbstream_uri() {
     let imported = import_server("olcrtc://room-123?key=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f&localPort=18080#WB").unwrap();
     assert_eq!(

@@ -1,10 +1,14 @@
 package com.kostra.vpn.plugin
 
+import android.Manifest
 import android.app.Activity
+import android.content.pm.PackageManager
 import android.content.Intent
 import android.net.VpnService
+import android.os.Build
 import android.os.SystemClock
 import androidx.activity.result.ActivityResult
+import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import app.tauri.annotation.ActivityCallback
 import app.tauri.annotation.Command
@@ -38,6 +42,7 @@ class VpnPlugin(private val activity: Activity) : Plugin(activity) {
 
     @Command
     fun startNativeVpn(invoke: Invoke) {
+        requestNotificationPermissionIfNeeded()
         val permissionIntent = VpnService.prepare(activity)
         if (permissionIntent != null) {
             startActivityForResult(invoke, permissionIntent, "startVpnAfterPermission")
@@ -113,6 +118,20 @@ class VpnPlugin(private val activity: Activity) : Plugin(activity) {
         }.start()
     }
 
+    private fun requestNotificationPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+            return
+        }
+        if (ContextCompat.checkSelfPermission(activity, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) {
+            return
+        }
+        ActivityCompat.requestPermissions(
+            activity,
+            arrayOf(Manifest.permission.POST_NOTIFICATIONS),
+            NOTIFICATION_PERMISSION_REQUEST_CODE
+        )
+    }
+
     @Command
     fun stopNativeVpn(invoke: Invoke) {
         val intent = Intent(activity, KostraVpnService::class.java)
@@ -146,5 +165,9 @@ class VpnPlugin(private val activity: Activity) : Plugin(activity) {
                 .put("uploadedBytes", stats.first)
                 .put("downloadedBytes", stats.second)
         )
+    }
+
+    private companion object {
+        const val NOTIFICATION_PERMISSION_REQUEST_CODE = 2001
     }
 }

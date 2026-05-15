@@ -2,9 +2,12 @@ package com.kostra.vpn.plugin
 
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.AlarmManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
 import android.net.ConnectivityManager
 import android.net.LinkProperties
 import android.net.Network
@@ -13,6 +16,8 @@ import android.net.NetworkRequest
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import android.os.Process
+import android.os.SystemClock
 import android.system.OsConstants
 import android.util.Log
 import androidx.core.app.NotificationCompat
@@ -43,11 +48,14 @@ import io.nekohasekai.libbox.SystemProxyStatus
 import io.nekohasekai.libbox.TunOptions
 import io.nekohasekai.libbox.WIFIState
 import java.io.File
+import java.net.HttpURLConnection
 import java.net.Inet6Address
 import java.net.InterfaceAddress
 import java.net.NetworkInterface
+import java.net.URL
 import java.security.KeyStore
 import java.util.Base64
+import java.util.concurrent.atomic.AtomicBoolean
 import io.nekohasekai.libbox.NetworkInterface as BoxNetworkInterface
 
 class KostraVpnService : VpnService(), PlatformInterface, CommandServerHandler {
@@ -56,9 +64,16 @@ class KostraVpnService : VpnService(), PlatformInterface, CommandServerHandler {
     private var tunnel: ParcelFileDescriptor? = null
     private var defaultInterfaceListener: InterfaceUpdateListener? = null
     private var defaultNetworkCallback: ConnectivityManager.NetworkCallback? = null
+    private var healthCheckThread: Thread? = null
+    private val healthCheckStop = AtomicBoolean(false)
+    private val lifecycleLock = Any()
+    private var consecutiveHealthFailures = 0
 
     private val connectivity: ConnectivityManager by lazy {
         getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+    }
+    private val preferences: SharedPreferences by lazy {
+        getSharedPreferences(PREFERENCES_NAME, Context.MODE_PRIVATE)
     }
 
     override fun onCreate() {
@@ -69,10 +84,37 @@ class KostraVpnService : VpnService(), PlatformInterface, CommandServerHandler {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
-            ACTION_START -> start(intent.getStringExtra(EXTRA_CONFIG).orEmpty())
-            ACTION_STOP -> stop()
+            ACTION_START -> {
+                val configJson = intent.getStringExtra(EXTRA_CONFIG).orEmpty()
+                if (configJson.isNotBlank()) {
+                    preferences.edit().putString(PREF_LAST_CONFIG, configJson).apply()
+                }
+                start(configJson)
+            }
+            ACTION_STOP -> {
+                preferences.edit().remove(PREF_LAST_CONFIG).apply()
+                stop()
+            }
+            ACTION_RESTART -> {
+                val configJson = preferences.getString(PREF_LAST_CONFIG, null)
+                if (configJson.isNullOrBlank()) {
+                    stopSelf()
+                } else {
+                    Log.i(TAG, "starting scheduled VPN recovery")
+                    start(configJson)
+                }
+            }
+            else -> {
+                val configJson = preferences.getString(PREF_LAST_CONFIG, null)
+                if (configJson.isNullOrBlank()) {
+                    stopSelf()
+                } else {
+                    Log.i(TAG, "restarting sticky VPN service")
+                    start(configJson)
+                }
+            }
         }
-        return START_NOT_STICKY
+        return START_STICKY
     }
 
     override fun onDestroy() {
@@ -81,36 +123,58 @@ class KostraVpnService : VpnService(), PlatformInterface, CommandServerHandler {
     }
 
     override fun onRevoke() {
+        preferences.edit().remove(PREF_LAST_CONFIG).apply()
         stop()
         super.onRevoke()
     }
 
-    private fun start(configJson: String) {
-        if (configJson.isBlank()) {
-            lastStartError = "empty sing-box config"
-            Log.e(TAG, "empty sing-box config")
-            stopSelf()
-            return
-        }
-        if (commandServer != null) {
-            return
-        }
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        Log.i(TAG, "app task removed, keeping foreground VPN service running")
+    }
 
-        try {
-            val server = CommandServer(this, this)
-            server.start()
-            server.startOrReloadService(configJson, OverrideOptions())
-            commandServer = server
-            startStatsClient()
-            Log.i(TAG, "sing-box libbox service started")
-        } catch (error: Exception) {
-            lastStartError = error.message ?: error.toString()
-            Log.e(TAG, "failed to start sing-box libbox service", error)
-            stop()
+    private fun start(configJson: String) {
+        synchronized(lifecycleLock) {
+            if (configJson.isBlank()) {
+                lastStartError = "empty sing-box config"
+                Log.e(TAG, "empty sing-box config")
+                stopSelf()
+                return
+            }
+            if (commandServer != null) {
+                return
+            }
+
+            try {
+                startCoreLocked(configJson)
+                startHealthWatchdog()
+                Log.i(TAG, "sing-box libbox service started")
+            } catch (error: Exception) {
+                lastStartError = error.message ?: error.toString()
+                Log.e(TAG, "failed to start sing-box libbox service", error)
+                stop()
+            }
         }
     }
 
     private fun stop() {
+        synchronized(lifecycleLock) {
+            stopHealthWatchdog()
+            stopCoreLocked()
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+        }
+    }
+
+    private fun startCoreLocked(configJson: String) {
+        val server = CommandServer(this, this)
+        server.start()
+        server.startOrReloadService(configJson, OverrideOptions())
+        commandServer = server
+        consecutiveHealthFailures = 0
+        startStatsClient()
+    }
+
+    private fun stopCoreLocked() {
         stopStatsClient()
         runCatching { commandServer?.closeService() }
         runCatching { commandServer?.close() }
@@ -119,8 +183,39 @@ class KostraVpnService : VpnService(), PlatformInterface, CommandServerHandler {
         tunnel = null
         tunEstablished = false
         resetTrafficStats()
-        stopForeground(STOP_FOREGROUND_REMOVE)
-        stopSelf()
+    }
+
+    private fun restartCoreFromWatchdog(reason: String) {
+        val configJson = preferences.getString(PREF_LAST_CONFIG, null)
+        if (configJson.isNullOrBlank()) {
+            return
+        }
+
+        Log.w(TAG, "restarting VPN process after health failure: $reason")
+        scheduleServiceRestart()
+        Thread.sleep(PROCESS_RESTART_DELAY_MS)
+        Process.killProcess(Process.myPid())
+    }
+
+    private fun scheduleServiceRestart() {
+        val intent = Intent(this, KostraVpnService::class.java).apply {
+            action = ACTION_RESTART
+            setPackage(packageName)
+        }
+        val flags = PendingIntent.FLAG_UPDATE_CURRENT or
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) PendingIntent.FLAG_IMMUTABLE else 0
+        val pendingIntent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            PendingIntent.getForegroundService(this, SERVICE_RESTART_REQUEST_CODE, intent, flags)
+        } else {
+            PendingIntent.getService(this, SERVICE_RESTART_REQUEST_CODE, intent, flags)
+        }
+        val alarmManager = getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        val triggerAt = SystemClock.elapsedRealtime() + SERVICE_RESTART_DELAY_MS
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            alarmManager.setAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, pendingIntent)
+        } else {
+            alarmManager.set(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, pendingIntent)
+        }
     }
 
     private fun startStatsClient() {
@@ -128,6 +223,7 @@ class KostraVpnService : VpnService(), PlatformInterface, CommandServerHandler {
         resetTrafficStats()
 
         val options = CommandClientOptions().apply {
+            addCommand(Libbox.CommandLog)
             addCommand(Libbox.CommandStatus)
             statusInterval = 1_000_000_000
         }
@@ -144,7 +240,15 @@ class KostraVpnService : VpnService(), PlatformInterface, CommandServerHandler {
 
             override fun clearLogs() {}
 
-            override fun writeLogs(messageList: LogIterator?) {}
+            override fun writeLogs(messageList: LogIterator?) {
+                if (messageList == null) {
+                    return
+                }
+                while (messageList.hasNext()) {
+                    val entry = messageList.next()
+                    Log.i("sing-box", entry.message)
+                }
+            }
 
             override fun writeStatus(message: StatusMessage?) {
                 if (message == null || !message.trafficAvailable) {
@@ -178,6 +282,76 @@ class KostraVpnService : VpnService(), PlatformInterface, CommandServerHandler {
     private fun stopStatsClient() {
         runCatching { statsClient?.disconnect() }
         statsClient = null
+    }
+
+    private fun startHealthWatchdog() {
+        if (healthCheckThread?.isAlive == true) {
+            return
+        }
+
+        healthCheckStop.set(false)
+        healthCheckThread = Thread {
+            while (!healthCheckStop.get()) {
+                try {
+                    Thread.sleep(HEALTH_CHECK_INTERVAL_MS)
+                } catch (_: InterruptedException) {
+                    continue
+                }
+
+                if (healthCheckStop.get() || !tunEstablished || commandServer == null) {
+                    continue
+                }
+
+                if (probeVpnConnectivity()) {
+                    consecutiveHealthFailures = 0
+                    continue
+                }
+
+                consecutiveHealthFailures += 1
+                Log.w(TAG, "VPN health check failed ($consecutiveHealthFailures/$HEALTH_CHECK_FAILURES_BEFORE_RESTART)")
+                if (consecutiveHealthFailures >= HEALTH_CHECK_FAILURES_BEFORE_RESTART) {
+                    restartCoreFromWatchdog("HTTPS probe timed out")
+                }
+            }
+        }.apply {
+            name = "KostraVpnHealthWatchdog"
+            isDaemon = true
+            start()
+        }
+    }
+
+    private fun stopHealthWatchdog() {
+        healthCheckStop.set(true)
+        val thread = healthCheckThread
+        if (thread != null && thread != Thread.currentThread()) {
+            thread.interrupt()
+        }
+        healthCheckThread = null
+        consecutiveHealthFailures = 0
+    }
+
+    private fun probeVpnConnectivity(): Boolean =
+        HEALTH_CHECK_URLS.any { url -> probeVpnUrl(url) }
+
+    private fun probeVpnUrl(url: String): Boolean {
+        var connection: HttpURLConnection? = null
+        return try {
+            connection = (URL(url).openConnection() as HttpURLConnection).apply {
+                connectTimeout = HEALTH_CHECK_TIMEOUT_MS
+                readTimeout = HEALTH_CHECK_TIMEOUT_MS
+                requestMethod = "GET"
+                instanceFollowRedirects = false
+                useCaches = false
+                setRequestProperty("User-Agent", "KOSTRA-VPN-HealthCheck/1.0")
+            }
+            val status = connection.responseCode
+            status in 200..399
+        } catch (error: Exception) {
+            Log.d(TAG, "VPN health probe failed for $url: ${error.message ?: error}")
+            false
+        } finally {
+            connection?.disconnect()
+        }
     }
 
     override fun openTun(options: TunOptions): Int {
@@ -292,10 +466,10 @@ class KostraVpnService : VpnService(), PlatformInterface, CommandServerHandler {
                 }
 
                 override fun onLost(network: Network) {
-                    if (connectivity.activeNetwork == network) {
+                    if (defaultUnderlyingNetwork() == network) {
                         listener.updateDefaultInterface("", -1, false, false)
                     } else {
-                        updateDefaultInterface(connectivity.activeNetwork)
+                        updateDefaultInterface(defaultUnderlyingNetwork())
                     }
                 }
             }
@@ -303,6 +477,7 @@ class KostraVpnService : VpnService(), PlatformInterface, CommandServerHandler {
                 connectivity.registerNetworkCallback(
                     NetworkRequest.Builder()
                         .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                        .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
                         .build(),
                     defaultNetworkCallback!!
                 )
@@ -310,7 +485,7 @@ class KostraVpnService : VpnService(), PlatformInterface, CommandServerHandler {
                 Log.e(TAG, "failed to register default network monitor", it)
             }
         }
-        updateDefaultInterface(connectivity.activeNetwork)
+        updateDefaultInterface(defaultUnderlyingNetwork())
     }
 
     override fun closeDefaultInterfaceMonitor(listener: InterfaceUpdateListener) {
@@ -326,6 +501,7 @@ class KostraVpnService : VpnService(), PlatformInterface, CommandServerHandler {
             runCatching {
                 val linkProperties = connectivity.getLinkProperties(network) ?: return@runCatching null
                 val capabilities = connectivity.getNetworkCapabilities(network) ?: return@runCatching null
+                if (!isUnderlyingNetwork(capabilities)) return@runCatching null
                 val name = linkProperties.interfaceName ?: return@runCatching null
                 val iface = networkInterfaces.find { it.name == name } ?: return@runCatching null
                 BoxNetworkInterface().apply {
@@ -404,9 +580,13 @@ class KostraVpnService : VpnService(), PlatformInterface, CommandServerHandler {
             }
 
             val capabilities = connectivity.getNetworkCapabilities(network)
-            val expensive = capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED) == false
+            if (capabilities == null || !isUnderlyingNetwork(capabilities)) {
+                updateDefaultInterface(defaultUnderlyingNetwork(excluding = network))
+                return
+            }
+            val expensive = !capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
             val constrained = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_CONGESTED) == false
+                !capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_CONGESTED)
             } else {
                 false
             }
@@ -417,6 +597,27 @@ class KostraVpnService : VpnService(), PlatformInterface, CommandServerHandler {
 
         listener.updateDefaultInterface("", -1, false, false)
     }
+
+    private fun defaultUnderlyingNetwork(excluding: Network? = null): Network? {
+        val active = connectivity.activeNetwork
+        if (active != null && active != excluding) {
+            val capabilities = connectivity.getNetworkCapabilities(active)
+            if (capabilities != null && isUnderlyingNetwork(capabilities)) {
+                return active
+            }
+        }
+
+        return connectivity.allNetworks.firstOrNull { network ->
+            if (network == excluding) return@firstOrNull false
+            val capabilities = connectivity.getNetworkCapabilities(network) ?: return@firstOrNull false
+            isUnderlyingNetwork(capabilities)
+        }
+    }
+
+    private fun isUnderlyingNetwork(capabilities: NetworkCapabilities): Boolean =
+        capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            && capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+            && !capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
 
     override fun serviceStop() {
         stop()
@@ -505,8 +706,21 @@ class KostraVpnService : VpnService(), PlatformInterface, CommandServerHandler {
         private const val TAG = "KostraVpnService"
         private const val CHANNEL_ID = "kostra-vpn"
         private const val NOTIFICATION_ID = 1001
+        private const val PREFERENCES_NAME = "kostra-vpn-service"
+        private const val PREF_LAST_CONFIG = "lastConfigJson"
+        private const val HEALTH_CHECK_INTERVAL_MS = 15_000L
+        private const val HEALTH_CHECK_TIMEOUT_MS = 5_000
+        private const val HEALTH_CHECK_FAILURES_BEFORE_RESTART = 2
+        private const val SERVICE_RESTART_REQUEST_CODE = 1002
+        private const val SERVICE_RESTART_DELAY_MS = 1_000L
+        private const val PROCESS_RESTART_DELAY_MS = 250L
+        private val HEALTH_CHECK_URLS = arrayOf(
+            "https://www.gstatic.com/generate_204",
+            "https://cp.cloudflare.com/generate_204"
+        )
         const val ACTION_START = "com.kostra.vpn.plugin.START"
         const val ACTION_STOP = "com.kostra.vpn.plugin.STOP"
+        const val ACTION_RESTART = "com.kostra.vpn.plugin.RESTART"
         const val EXTRA_CONFIG = "configJson"
 
         @Volatile

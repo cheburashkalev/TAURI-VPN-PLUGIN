@@ -1,5 +1,5 @@
 use crate::{
-    models::{ConnectOptions, RouteMode, TransportKind, VpnProfile, VpnProtocol},
+    models::{ConnectOptions, DnsStrategy, RouteMode, TransportKind, VpnProfile, VpnProtocol},
     olcrtc, protocols, Result, VpnError,
 };
 use serde_json::{json, Value};
@@ -32,11 +32,8 @@ pub fn generate_sing_box_config(options: &ConnectOptions) -> Result<Value> {
         RouteMode::Global | RouteMode::Rule => "proxy",
     };
     let route_rules = route_rules_for_profile(&options.profile);
-    let tun_stack = if cfg!(any(target_os = "android", target_os = "ios")) {
-        "gvisor"
-    } else {
-        "mixed"
-    };
+    let tun_stack = tun_stack_for_profile(&options.profile);
+    let tun_mtu = tun_mtu_for_profile(&options.profile);
     let dns_servers = dns_servers_for_options(options);
 
     Ok(json!({
@@ -46,6 +43,7 @@ pub fn generate_sing_box_config(options: &ConnectOptions) -> Result<Value> {
         },
         "dns": {
             "servers": dns_servers,
+            "strategy": dns_strategy(options.dns.strategy),
             "final": "dns-0"
         },
         "inbounds": [
@@ -53,9 +51,12 @@ pub fn generate_sing_box_config(options: &ConnectOptions) -> Result<Value> {
                 "type": "tun",
                 "tag": "tun-in",
                 "address": ["198.18.0.1/30"],
+                "mtu": tun_mtu,
                 "route_exclude_address": LOCAL_NETWORK_CIDRS,
                 "auto_route": true,
                 "strict_route": options.kill_switch,
+                "endpoint_independent_nat": true,
+                "udp_timeout": "5m",
                 "stack": tun_stack
             },
             {
@@ -88,7 +89,13 @@ fn dns_servers_for_options(options: &ConnectOptions) -> Vec<Value> {
     let upstreams = if options.dns.servers.is_empty() {
         vec!["1.1.1.1".to_string()]
     } else {
-        options.dns.servers.clone()
+        options
+            .dns
+            .servers
+            .iter()
+            .map(|server| server.trim().to_string())
+            .filter(|server| !server.is_empty())
+            .collect()
     };
     let bootstrap = upstreams
         .first()
@@ -102,24 +109,67 @@ fn dns_servers_for_options(options: &ConnectOptions) -> Vec<Value> {
         "server_port": 53
     })];
 
-    servers.extend(upstreams.iter().enumerate().map(|(index, server)| {
-        json!({
-            "type": "tcp",
-            "tag": format!("dns-{index}"),
-            "server": server,
-            "server_port": 53,
-            "detour": "proxy"
-        })
-    }));
+    servers.extend(
+        upstreams
+            .iter()
+            .enumerate()
+            .map(|(index, server)| dns_server_for_upstream(index, server)),
+    );
 
     servers
 }
 
+fn dns_server_for_upstream(index: usize, server: &str) -> Value {
+    if let Some(server_name) = public_doh_server_name(server) {
+        return json!({
+            "type": "https",
+            "tag": format!("dns-{index}"),
+            "server": server,
+            "server_port": 443,
+            "path": "/dns-query",
+            "detour": "proxy",
+            "connect_timeout": "5s",
+            "tls": {
+                "enabled": true,
+                "server_name": server_name
+            }
+        });
+    }
+
+    json!({
+        "type": "tcp",
+        "tag": format!("dns-{index}"),
+        "server": server,
+        "server_port": 53,
+        "detour": "proxy",
+        "connect_timeout": "5s"
+    })
+}
+
+fn public_doh_server_name(server: &str) -> Option<&'static str> {
+    match server {
+        "1.1.1.1" | "1.0.0.1" | "2606:4700:4700::1111" | "2606:4700:4700::1001" => {
+            Some("cloudflare-dns.com")
+        }
+        "8.8.8.8" | "8.8.4.4" | "2001:4860:4860::8888" | "2001:4860:4860::8844" => {
+            Some("dns.google")
+        }
+        "9.9.9.9" | "149.112.112.112" | "2620:fe::fe" | "2620:fe::9" => Some("dns.quad9.net"),
+        _ => None,
+    }
+}
+
+fn dns_strategy(strategy: DnsStrategy) -> &'static str {
+    match strategy {
+        DnsStrategy::Ipv4Only => "ipv4_only",
+        DnsStrategy::Ipv6Only => "ipv6_only",
+        DnsStrategy::PreferIpv4 => "prefer_ipv4",
+        DnsStrategy::PreferIpv6 => "prefer_ipv6",
+    }
+}
+
 fn route_rules_for_profile(profile: &VpnProfile) -> Vec<Value> {
     let mut rules = vec![
-        json!({
-            "action": "sniff"
-        }),
         json!({
             "protocol": "dns",
             "action": "hijack-dns"
@@ -135,6 +185,19 @@ fn route_rules_for_profile(profile: &VpnProfile) -> Vec<Value> {
             "outbound": "direct"
         }),
     ];
+
+    rules.extend([
+        json!({
+            "network": "icmp",
+            "action": "reject",
+            "method": "default"
+        }),
+        json!({
+            "network": ["tcp", "udp"],
+            "action": "route",
+            "outbound": "proxy"
+        }),
+    ]);
 
     if matches!(profile.protocol, VpnProtocol::OlcRtc) {
         rules.extend([
@@ -167,6 +230,34 @@ fn route_rules_for_profile(profile: &VpnProfile) -> Vec<Value> {
     }
 
     rules
+}
+
+fn tun_stack_for_profile(profile: &VpnProfile) -> &'static str {
+    if cfg!(any(target_os = "android", target_os = "ios")) {
+        return "gvisor";
+    }
+
+    if cfg!(target_os = "windows")
+        && matches!(
+            profile.protocol,
+            VpnProtocol::Hysteria | VpnProtocol::Hysteria2 | VpnProtocol::Tuic
+        )
+    {
+        return "gvisor";
+    }
+
+    "mixed"
+}
+
+fn tun_mtu_for_profile(profile: &VpnProfile) -> u16 {
+    if matches!(
+        profile.protocol,
+        VpnProtocol::Hysteria | VpnProtocol::Hysteria2 | VpnProtocol::Tuic
+    ) {
+        return 1500;
+    }
+
+    1400
 }
 
 fn outbound_for_profile(profile: &VpnProfile) -> Result<Value> {
@@ -219,20 +310,24 @@ fn outbound_for_profile(profile: &VpnProfile) -> Result<Value> {
                 "reserved": wg.reserved
             })
         }
-        VpnProtocol::Hysteria => json!({
+        VpnProtocol::Hysteria => json!(strip_nulls(json!({
             "type": "hysteria",
             "tag": "proxy",
             "server": profile.server,
             "server_port": profile.port,
-            "auth_str": required(profile.auth.password.as_deref(), "password")?
-        }),
-        VpnProtocol::Hysteria2 => json!({
+            "auth_str": required(profile.auth.password.as_deref(), "password")?,
+            "up_mbps": 10000,
+            "down_mbps": 10000,
+            "obfs": profile.extra.get("obfs").and_then(Value::as_str)
+        }))),
+        VpnProtocol::Hysteria2 => json!(strip_nulls(json!({
             "type": "hysteria2",
             "tag": "proxy",
             "server": profile.server,
             "server_port": profile.port,
-            "password": required(profile.auth.password.as_deref(), "password")?
-        }),
+            "password": required(profile.auth.password.as_deref(), "password")?,
+            "obfs": hysteria2_obfs(profile)
+        }))),
         VpnProtocol::Tuic => json!({
             "type": "tuic",
             "tag": "proxy",
@@ -281,20 +376,33 @@ fn outbound_for_profile(profile: &VpnProfile) -> Result<Value> {
 fn add_tls(profile: &VpnProfile, outbound: &mut Value) {
     if let Some(tls) = &profile.tls {
         if tls.enabled {
+            let utls = if supports_utls(profile.protocol) {
+                tls.fingerprint.as_ref().map(|fingerprint| json!({
+                    "enabled": true,
+                    "fingerprint": fingerprint
+                }))
+            } else {
+                None
+            };
             outbound["tls"] = json!({
                 "enabled": true,
                 "server_name": tls.server_name,
                 "alpn": tls.alpn,
                 "insecure": tls.insecure,
-                "utls": tls.fingerprint.as_ref().map(|fingerprint| json!({
-                    "enabled": true,
-                    "fingerprint": fingerprint
-                }))
+                "utls": utls
             });
         }
     }
 
     if let Some(reality) = &profile.reality {
+        let utls = if supports_utls(profile.protocol) {
+            profile.tls.as_ref().and_then(|tls| tls.fingerprint.as_ref()).map(|fingerprint| json!({
+                "enabled": true,
+                "fingerprint": fingerprint
+            }))
+        } else {
+            None
+        };
         outbound["tls"] = json!({
             "enabled": true,
             "server_name": profile.tls.as_ref().and_then(|tls| tls.server_name.clone()),
@@ -303,12 +411,36 @@ fn add_tls(profile: &VpnProfile, outbound: &mut Value) {
                 "public_key": reality.public_key,
                 "short_id": reality.short_id
             },
-            "utls": profile.tls.as_ref().and_then(|tls| tls.fingerprint.as_ref()).map(|fingerprint| json!({
-                "enabled": true,
-                "fingerprint": fingerprint
-            }))
+            "utls": utls
         });
     }
+}
+
+fn supports_utls(protocol: VpnProtocol) -> bool {
+    !matches!(
+        protocol,
+        VpnProtocol::Hysteria | VpnProtocol::Hysteria2 | VpnProtocol::Tuic
+    )
+}
+
+fn hysteria2_obfs(profile: &VpnProfile) -> Option<Value> {
+    let obfs_type = profile.extra.get("obfs").and_then(Value::as_str)?;
+    let password = profile
+        .extra
+        .get("obfs-password")
+        .or_else(|| profile.extra.get("obfsPassword"))
+        .and_then(Value::as_str)?;
+    Some(json!({
+        "type": obfs_type,
+        "password": password
+    }))
+}
+
+fn strip_nulls(mut value: Value) -> Value {
+    if let Value::Object(map) = &mut value {
+        map.retain(|_, item| !item.is_null());
+    }
+    value
 }
 
 fn add_transport(profile: &VpnProfile, outbound: &mut Value) {
