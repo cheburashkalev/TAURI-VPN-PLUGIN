@@ -86,13 +86,22 @@ class KostraVpnService : VpnService(), PlatformInterface, CommandServerHandler {
         when (intent?.action) {
             ACTION_START -> {
                 val configJson = intent.getStringExtra(EXTRA_CONFIG).orEmpty()
+                val profileId = intent.getStringExtra(EXTRA_PROFILE_ID)
                 if (configJson.isNotBlank()) {
-                    preferences.edit().putString(PREF_LAST_CONFIG, configJson).apply()
+                    preferences.edit().let {
+                        it.putString(PREF_LAST_CONFIG, configJson)
+                        if (profileId != null) {
+                            it.putString(PREF_LAST_PROFILE_ID, profileId)
+                        } else {
+                            it.remove(PREF_LAST_PROFILE_ID)
+                        }
+                        it.apply()
+                    }
                 }
                 start(configJson)
             }
             ACTION_STOP -> {
-                preferences.edit().remove(PREF_LAST_CONFIG).apply()
+                preferences.edit().remove(PREF_LAST_CONFIG).remove(PREF_LAST_PROFILE_ID).apply()
                 stop()
             }
             ACTION_RESTART -> {
@@ -141,6 +150,16 @@ class KostraVpnService : VpnService(), PlatformInterface, CommandServerHandler {
                 return
             }
             if (commandServer != null) {
+                if (tunEstablished) {
+                    lastStartError = null
+                    Log.i(TAG, "start requested while VPN is already running")
+                    return
+                }
+
+                Log.w(TAG, "start requested while core exists but TUN is not established, restarting core")
+                stopCoreLocked()
+                startCoreLocked(configJson)
+                startHealthWatchdog()
                 return
             }
 
@@ -708,6 +727,7 @@ class KostraVpnService : VpnService(), PlatformInterface, CommandServerHandler {
         private const val NOTIFICATION_ID = 1001
         private const val PREFERENCES_NAME = "kostra-vpn-service"
         private const val PREF_LAST_CONFIG = "lastConfigJson"
+        private const val PREF_LAST_PROFILE_ID = "lastProfileId"
         private const val HEALTH_CHECK_INTERVAL_MS = 15_000L
         private const val HEALTH_CHECK_TIMEOUT_MS = 5_000
         private const val HEALTH_CHECK_FAILURES_BEFORE_RESTART = 2
@@ -722,6 +742,7 @@ class KostraVpnService : VpnService(), PlatformInterface, CommandServerHandler {
         const val ACTION_STOP = "com.kostra.vpn.plugin.STOP"
         const val ACTION_RESTART = "com.kostra.vpn.plugin.RESTART"
         const val EXTRA_CONFIG = "configJson"
+        const val EXTRA_PROFILE_ID = "profileId"
 
         @Volatile
         private var tunEstablished = false
@@ -736,13 +757,17 @@ class KostraVpnService : VpnService(), PlatformInterface, CommandServerHandler {
         private var downloadTotalBytes: Long = 0
 
         fun resetStartState() {
-            tunEstablished = false
             lastStartError = null
         }
 
         fun isTunEstablished(): Boolean = tunEstablished
 
         fun getLastStartError(): String? = lastStartError
+
+        fun getLastProfileId(context: Context): String? {
+            return context.getSharedPreferences(PREFERENCES_NAME, Context.MODE_PRIVATE)
+                .getString(PREF_LAST_PROFILE_ID, null)
+        }
 
         fun resetTrafficStats() {
             uploadTotalBytes = 0

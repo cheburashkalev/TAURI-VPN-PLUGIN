@@ -6,10 +6,10 @@ import android.content.pm.PackageManager
 import android.content.Intent
 import android.net.VpnService
 import android.os.Build
-import android.os.SystemClock
 import androidx.activity.result.ActivityResult
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import android.util.Log
 import app.tauri.annotation.ActivityCallback
 import app.tauri.annotation.Command
 import app.tauri.annotation.InvokeArg
@@ -22,6 +22,7 @@ import app.tauri.plugin.Plugin
 @InvokeArg
 internal class ConnectArgs {
     lateinit var configJson: String
+    var profileId: String? = null
 }
 
 @TauriPlugin(
@@ -32,6 +33,10 @@ internal class ConnectArgs {
 class VpnPlugin(private val activity: Activity) : Plugin(activity) {
     @Command
     fun requestVpnPermission(invoke: Invoke) {
+        val activity = this.activity ?: run {
+            invoke.reject("Activity is not available")
+            return
+        }
         val intent = VpnService.prepare(activity)
         if (intent == null) {
             invoke.resolve(JSObject().put("granted", true))
@@ -42,6 +47,10 @@ class VpnPlugin(private val activity: Activity) : Plugin(activity) {
 
     @Command
     fun startNativeVpn(invoke: Invoke) {
+        val activity = this.activity ?: run {
+            invoke.reject("Activity is not available")
+            return
+        }
         requestNotificationPermissionIfNeeded()
         val permissionIntent = VpnService.prepare(activity)
         if (permissionIntent != null) {
@@ -50,11 +59,15 @@ class VpnPlugin(private val activity: Activity) : Plugin(activity) {
         }
 
         val args = invoke.parseArgs(ConnectArgs::class.java)
-        startVpnAndAwaitTun(invoke, args.configJson)
+        startVpn(invoke, args.configJson, args.profileId)
     }
 
     @ActivityCallback
     fun vpnPermissionResult(invoke: Invoke, _result: ActivityResult) {
+        val activity = this.activity ?: run {
+            invoke.reject("Activity is not available")
+            return
+        }
         if (VpnService.prepare(activity) == null) {
             invoke.resolve(JSObject().put("granted", true))
         } else {
@@ -64,19 +77,35 @@ class VpnPlugin(private val activity: Activity) : Plugin(activity) {
 
     @ActivityCallback
     fun startVpnAfterPermission(invoke: Invoke, _result: ActivityResult) {
+        val activity = this.activity ?: run {
+            invoke.reject("Activity is not available")
+            return
+        }
         if (VpnService.prepare(activity) != null) {
             invoke.reject("Android VPN permission was not granted.", "VPN_PERMISSION_DENIED")
             return
         }
 
         val args = invoke.parseArgs(ConnectArgs::class.java)
-        startVpnAndAwaitTun(invoke, args.configJson)
+        startVpn(invoke, args.configJson, args.profileId)
     }
 
-    private fun startVpnAndAwaitTun(invoke: Invoke, configJson: String) {
+    private fun startVpn(invoke: Invoke, configJson: String, profileId: String?) {
+        val activity = this.activity ?: run {
+            invoke.reject("Activity is not available")
+            return
+        }
+        if (KostraVpnService.isTunEstablished()) {
+            invoke.resolve(JSObject().put("started", true))
+            return
+        }
+
         val intent = Intent(activity, KostraVpnService::class.java)
         intent.action = KostraVpnService.ACTION_START
         intent.putExtra(KostraVpnService.EXTRA_CONFIG, configJson)
+        if (profileId != null) {
+            intent.putExtra(KostraVpnService.EXTRA_PROFILE_ID, profileId)
+        }
         try {
             KostraVpnService.resetStartState()
             ContextCompat.startForegroundService(activity, intent)
@@ -85,40 +114,11 @@ class VpnPlugin(private val activity: Activity) : Plugin(activity) {
             return
         }
 
-        Thread {
-            val deadline = SystemClock.elapsedRealtime() + 10_000
-            while (SystemClock.elapsedRealtime() < deadline) {
-                val error = KostraVpnService.getLastStartError()
-                if (error != null) {
-                    activity.runOnUiThread {
-                        invoke.reject("Android VPN failed to start: $error", "VPN_START_FAILED")
-                    }
-                    return@Thread
-                }
-
-                if (KostraVpnService.isTunEstablished()) {
-                    activity.runOnUiThread {
-                        invoke.resolve(JSObject().put("started", true))
-                    }
-                    return@Thread
-                }
-
-                Thread.sleep(100)
-            }
-
-            val stopIntent = Intent(activity, KostraVpnService::class.java)
-            stopIntent.action = KostraVpnService.ACTION_STOP
-            activity.startService(stopIntent)
-            activity.runOnUiThread {
-                invoke.reject(
-                    "Android VPN TUN was not established within 10 seconds. Check Android logcat for KostraVpnService and sing-box logs.",
-                    "VPN_TUN_NOT_ESTABLISHED"
-                )
-            }
-        }.start()
+        invoke.resolve(JSObject().put("started", true))
     }
 
     private fun requestNotificationPermissionIfNeeded() {
+        val activity = this.activity ?: return
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
             return
         }
@@ -134,27 +134,14 @@ class VpnPlugin(private val activity: Activity) : Plugin(activity) {
 
     @Command
     fun stopNativeVpn(invoke: Invoke) {
+        val activity = this.activity ?: run {
+            invoke.reject("Activity is not available")
+            return
+        }
         val intent = Intent(activity, KostraVpnService::class.java)
         intent.action = KostraVpnService.ACTION_STOP
         activity.startService(intent)
-
-        Thread {
-            val deadline = SystemClock.elapsedRealtime() + 5_000
-            while (SystemClock.elapsedRealtime() < deadline) {
-                if (!KostraVpnService.isTunEstablished()) {
-                    activity.runOnUiThread {
-                        invoke.resolve(JSObject().put("stopped", true))
-                    }
-                    return@Thread
-                }
-
-                Thread.sleep(100)
-            }
-
-            activity.runOnUiThread {
-                invoke.resolve(JSObject().put("stopped", true))
-            }
-        }.start()
+        invoke.resolve(JSObject().put("stopped", true))
     }
 
     @Command
@@ -162,6 +149,31 @@ class VpnPlugin(private val activity: Activity) : Plugin(activity) {
         val stats = KostraVpnService.getTrafficStats()
         invoke.resolve(
             JSObject()
+                .put("uploadedBytes", stats.first)
+                .put("downloadedBytes", stats.second)
+        )
+    }
+
+    @Command
+    fun getNativeVpnStatus(invoke: Invoke) {
+        val stats = KostraVpnService.getTrafficStats()
+        val activity = this.activity ?: run {
+            // If activity is not available, we can't get preferences, but we might still know if TUN is up
+            invoke.resolve(
+                JSObject()
+                    .put("established", KostraVpnService.isTunEstablished())
+                    .put("lastError", KostraVpnService.getLastStartError())
+                    .put("activeProfileId", null)
+                    .put("uploadedBytes", stats.first)
+                    .put("downloadedBytes", stats.second)
+            )
+            return
+        }
+        invoke.resolve(
+            JSObject()
+                .put("established", KostraVpnService.isTunEstablished())
+                .put("lastError", KostraVpnService.getLastStartError())
+                .put("activeProfileId", KostraVpnService.getLastProfileId(activity))
                 .put("uploadedBytes", stats.first)
                 .put("downloadedBytes", stats.second)
         )

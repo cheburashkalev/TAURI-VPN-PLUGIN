@@ -67,10 +67,35 @@ pub async fn disconnect<R: Runtime>(
 
 #[tauri::command]
 pub async fn status<R: Runtime>(
-    _app: AppHandle<R>,
+    app: AppHandle<R>,
     state: State<'_, VpnState<R>>,
 ) -> Result<ConnectionStatus> {
-    Ok(state.status.lock().await.clone())
+    let _ = app;
+    let status = state.status.lock().await;
+
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    let mut status = status; 
+
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        if status.phase == ConnectionPhase::Disconnected {
+            if let Ok((established, profile_id)) =
+                state.engine.get_mobile_status(&app, state.mobile.as_ref()).await
+            {
+                if established {
+                    status.phase = ConnectionPhase::Connected;
+                    status.message = Some("Connected (Recovered)".into());
+                    if let Some(id_str) = profile_id {
+                        if let Ok(uuid) = uuid::Uuid::parse_str(&id_str) {
+                            status.active_profile_id = Some(uuid);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(status.clone())
 }
 
 #[tauri::command(rename_all = "camelCase")]

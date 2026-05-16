@@ -13,6 +13,7 @@ use serde::Deserialize;
 use std::{
     path::{Path, PathBuf},
     process::Stdio,
+    sync::Mutex as StdMutex,
 };
 use tauri::{plugin::PluginHandle, AppHandle, Emitter, Manager, Runtime};
 use tokio::{
@@ -30,19 +31,14 @@ const CONFIG_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 const DESKTOP_STOP_TIMEOUT: Duration = Duration::from_secs(8);
 const DESKTOP_STATS_TIMEOUT: Duration = Duration::from_secs(3);
 const PORT_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
-#[cfg(any(target_os = "android", target_os = "ios"))]
-const MOBILE_START_TIMEOUT: Duration = Duration::from_secs(15);
-#[cfg(any(target_os = "android", target_os = "ios"))]
-const MOBILE_STOP_TIMEOUT: Duration = Duration::from_secs(8);
-#[cfg(target_os = "android")]
-const MOBILE_STATS_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub struct SingBoxEngine {
     child: Mutex<Option<Child>>,
     olcrtc: Mutex<Option<OlcRtcRuntime>>,
     #[cfg(any(target_os = "android", target_os = "ios"))]
     mobile_connected: Mutex<bool>,
-    stats_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    stats_task: StdMutex<Option<tauri::async_runtime::JoinHandle<()>>>,
 }
 
 impl Default for SingBoxEngine {
@@ -52,7 +48,8 @@ impl Default for SingBoxEngine {
             olcrtc: Mutex::new(None),
             #[cfg(any(target_os = "android", target_os = "ios"))]
             mobile_connected: Mutex::new(false),
-            stats_task: Mutex::new(None),
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            stats_task: StdMutex::new(None),
         }
     }
 }
@@ -180,22 +177,62 @@ impl SingBoxEngine {
             ));
         };
 
-        timeout(
-            MOBILE_START_TIMEOUT,
-            mobile.run_mobile_plugin_async::<NativeStartResponse>(
+        mobile
+            .run_mobile_plugin_async::<NativeStartResponse>(
                 "startNativeVpn",
-                NativeConnectArgs { config_json },
-            ),
-        )
-        .await
-        .map_err(|_| VpnError::Platform("native VPN start timed out".into()))?
+                NativeConnectArgs {
+                    config_json,
+                    profile_id: Some(options.profile.id.to_string()),
+                },
+            )
+            .await
             .map_err(|error| VpnError::Platform(format!("native VPN start failed: {error}")))?;
 
         *self.mobile_connected.lock().await = true;
-        #[cfg(target_os = "android")]
-        self.start_mobile_stats_polling(app, mobile.clone()).await;
         let _ = app.emit("vpn:log", "native mobile VPN start requested");
         Ok(warnings)
+    }
+
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    pub async fn get_mobile_status<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        mobile: Option<&PluginHandle<R>>,
+    ) -> Result<(bool, Option<String>)> {
+        let Some(mobile) = mobile else {
+            return Ok((false, None));
+        };
+
+        // If the bridge is not ready, it might return an error. 
+        // We retry up to 3 times with increasing delay.
+        let mut last_error = None;
+        for i in 0..3 {
+            match mobile.run_mobile_plugin_async::<NativeStatusResponse>("getNativeVpnStatus", ()).await {
+                Ok(response) => {
+                    if response.established {
+                        *self.mobile_connected.lock().await = true;
+                        if let (Some(up), Some(down)) = (response.uploaded_bytes, response.downloaded_bytes) {
+                            let _ = app.emit("vpn:stats", TrafficStats {
+                                uploaded_bytes: up,
+                                downloaded_bytes: down,
+                            });
+                        }
+                    } else {
+                        *self.mobile_connected.lock().await = false;
+                    }
+                    return Ok((response.established, response.active_profile_id));
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                    tokio::time::sleep(std::time::Duration::from_millis(500 * (i + 1))).await;
+                }
+            }
+        }
+
+        let error = last_error.unwrap();
+        Err(VpnError::Platform(format!(
+            "failed to query native VPN status after retries: {error}"
+        )))
     }
 
     pub async fn stop<R: Runtime>(
@@ -246,8 +283,7 @@ impl SingBoxEngine {
         app: &AppHandle<R>,
         mobile: Option<&PluginHandle<R>>,
     ) -> Result<()> {
-        let mut connected = self.mobile_connected.lock().await;
-        if !*connected {
+        if !*self.mobile_connected.lock().await {
             return Err(VpnError::NotRunning);
         }
 
@@ -257,110 +293,93 @@ impl SingBoxEngine {
             ));
         };
 
-        timeout(
-            MOBILE_STOP_TIMEOUT,
-            mobile.run_mobile_plugin_async::<NativeStopResponse>("stopNativeVpn", ()),
-        )
-        .await
-        .map_err(|_| VpnError::Platform("native VPN stop timed out".into()))?
+        mobile
+            .run_mobile_plugin_async::<NativeStopResponse>("stopNativeVpn", ())
+            .await
             .map_err(|error| VpnError::Platform(format!("native VPN stop failed: {error}")))?;
 
         self.stop_stats_polling().await;
-        *connected = false;
+        *self.mobile_connected.lock().await = false;
         let _ = app.emit("vpn:log", "native mobile VPN stop requested");
         Ok(())
     }
 
-    async fn start_stats_polling<R: Runtime>(&self, app: &AppHandle<R>) {
-        let mut guard = self.stats_task.lock().await;
-        if let Some(task) = guard.take() {
-            task.abort();
+    pub async fn start_stats_polling<R: Runtime>(&self, app: &AppHandle<R>) {
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        {
+            let _ = app;
+            return;
         }
 
-        let app = app.clone();
-        *guard = Some(tauri::async_runtime::spawn(async move {
-            let client = reqwest::Client::builder()
-                .timeout(DESKTOP_STATS_TIMEOUT)
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new());
-            let url = format!("http://{}/connections", config::CLASH_API_ADDR);
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        {
+            {
+                let mut guard = self.stats_task.lock().unwrap();
+                if let Some(task) = guard.take() {
+                    task.abort();
+                }
+            }
 
-            loop {
-                sleep(Duration::from_secs(1)).await;
-                match client.get(&url).send().await {
-                    Ok(response) => match response.json::<ConnectionsStats>().await {
-                        Ok(stats) => {
-                            let traffic = TrafficStats {
-                                uploaded_bytes: stats.upload_total,
-                                downloaded_bytes: stats.download_total,
-                            };
-                            let _ = app.emit("vpn:stats", traffic);
-                        }
+            let app = app.clone();
+            let task = tauri::async_runtime::spawn(async move {
+                let client = reqwest::Client::builder()
+                    .timeout(DESKTOP_STATS_TIMEOUT)
+                    .build()
+                    .unwrap_or_else(|_| reqwest::Client::new());
+                let url = format!("http://{}/connections", config::CLASH_API_ADDR);
+
+                loop {
+                    sleep(Duration::from_secs(1)).await;
+                    match client.get(&url).send().await {
+                        Ok(response) => match response.json::<ConnectionsStats>().await {
+                            Ok(stats) => {
+                                let traffic = TrafficStats {
+                                    uploaded_bytes: stats.upload_total,
+                                    downloaded_bytes: stats.download_total,
+                                };
+                                let _ = app.emit("vpn:stats", traffic);
+                            }
+                            Err(error) => {
+                                let _ = app.emit(
+                                    "vpn:log",
+                                    format!("failed to decode traffic stats: {error}"),
+                                );
+                            }
+                        },
                         Err(error) => {
-                            let _ = app.emit(
-                                "vpn:log",
-                                format!("failed to decode traffic stats: {error}"),
-                            );
+                            let _ =
+                                app.emit("vpn:log", format!("failed to query traffic stats: {error}"));
                         }
-                    },
-                    Err(error) => {
-                        let _ =
-                            app.emit("vpn:log", format!("failed to query traffic stats: {error}"));
                     }
                 }
-            }
-        }));
-    }
+            });
 
-    async fn stop_stats_polling(&self) {
-        if let Some(task) = self.stats_task.lock().await.take() {
-            task.abort();
+            if let Ok(mut guard) = self.stats_task.lock() {
+                *guard = Some(task);
+            }
         }
     }
 
-    #[cfg(target_os = "android")]
-    async fn start_mobile_stats_polling<R: Runtime>(
-        &self,
-        app: &AppHandle<R>,
-        mobile: PluginHandle<R>,
-    ) {
-        let mut guard = self.stats_task.lock().await;
-        if let Some(task) = guard.take() {
-            task.abort();
-        }
-
-        let app = app.clone();
-        *guard = Some(tauri::async_runtime::spawn(async move {
-            loop {
-                sleep(Duration::from_secs(1)).await;
-                match timeout(
-                    MOBILE_STATS_TIMEOUT,
-                    mobile.run_mobile_plugin_async::<NativeTrafficStats>(
-                        "getNativeTrafficStats",
-                        (),
-                    ),
-                )
-                .await
-                {
-                    Ok(Ok(stats)) => {
-                        let traffic = TrafficStats {
-                            uploaded_bytes: stats.uploaded_bytes,
-                            downloaded_bytes: stats.downloaded_bytes,
-                        };
-                        let _ = app.emit("vpn:stats", traffic);
-                    }
-                    Ok(Err(error)) => {
-                        let _ = app.emit(
-                            "vpn:log",
-                            format!("failed to query Android traffic stats: {error}"),
-                        );
-                    }
-                    Err(_) => {
-                        let _ = app.emit("vpn:log", "Android traffic stats query timed out");
-                    }
-                }
+    pub async fn stop_stats_polling(&self) {
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        if let Ok(mut guard) = self.stats_task.lock() {
+            if let Some(task) = guard.take() {
+                task.abort();
+                // On some runtimes, task doesn't immediately stop. 
+                // We don't wait here because it's async, but we've removed it from the state.
             }
-        }));
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+impl Drop for SingBoxEngine {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.stats_task.lock() {
+            if let Some(task) = guard.take() {
+                task.abort();
+            }
+        }
     }
 }
 
@@ -369,28 +388,35 @@ impl SingBoxEngine {
 #[serde(rename_all = "camelCase")]
 struct NativeConnectArgs {
     config_json: String,
+    profile_id: Option<String>,
 }
 
 #[cfg(any(target_os = "android", target_os = "ios"))]
-#[derive(Deserialize)]
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct NativeStartResponse {
     #[allow(dead_code)]
     started: bool,
 }
 
 #[cfg(any(target_os = "android", target_os = "ios"))]
-#[derive(Deserialize)]
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct NativeStopResponse {
     #[allow(dead_code)]
     stopped: bool,
 }
 
-#[cfg(target_os = "android")]
-#[derive(Deserialize)]
+#[cfg(any(target_os = "android", target_os = "ios"))]
+#[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct NativeTrafficStats {
-    uploaded_bytes: u64,
-    downloaded_bytes: u64,
+struct NativeStatusResponse {
+    established: bool,
+    #[allow(dead_code)]
+    last_error: Option<String>,
+    active_profile_id: Option<String>,
+    uploaded_bytes: Option<u64>,
+    downloaded_bytes: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
