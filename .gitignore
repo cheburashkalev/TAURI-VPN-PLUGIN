@@ -15,6 +15,7 @@ android/.tauri/
 
 # iOS/Xcode local output
 ios/.build/
+ios-tunnel/.build/
 ios/DerivedData/
 ios/*.xcuserdata/
 
