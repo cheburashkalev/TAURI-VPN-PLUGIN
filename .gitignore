@@ -22,7 +22,7 @@ ios/*.xcuserdata/
 .env
 .env.*
 !.env.example
-
+._*
 # Logs and editor files
 *.log
 npm-debug.log*

@@ -2,23 +2,28 @@
 import PackageDescription
 
 let package = Package(
-    name: "VpnPlugin",
+    name: "tauri-plugin-vpn",
     platforms: [
         .iOS(.v15),
         .macOS(.v13)
     ],
     products: [
-        .library(name: "VpnPlugin", targets: ["VpnPlugin"])
+        .library(
+            name: "tauri-plugin-vpn",
+            type: .static,
+            targets: ["tauri-plugin-vpn"]
+        )
     ],
     dependencies: [
-        .package(url: "https://github.com/tauri-apps/tauri", from: "2.0.0")
+        .package(name: "Tauri", path: "../.tauri/tauri-api")
     ],
     targets: [
         .target(
-            name: "VpnPlugin",
+            name: "tauri-plugin-vpn",
             dependencies: [
-                .product(name: "Tauri", package: "tauri")
-            ]
+                .byName(name: "Tauri")
+            ],
+            path: "Sources/VpnPlugin"
         )
     ]
 )
