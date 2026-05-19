@@ -3,6 +3,8 @@ pub mod config;
 mod engine;
 mod errors;
 pub mod import;
+#[cfg(target_os = "macos")]
+mod macos_vpn;
 pub mod models;
 mod olcrtc;
 mod platform;

@@ -29,7 +29,7 @@ pub fn check_platform_requirements() -> Result<Vec<String>> {
     }
     if cfg!(target_os = "macos") {
         warnings.push(
-            "macOS TUN mode may require user approval for network extension/system extension"
+            "macOS system tunnel requires administrator approval to configure the TUN interface"
                 .into(),
         );
     }

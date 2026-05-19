@@ -16,8 +16,10 @@ use std::{
     sync::Mutex as StdMutex,
 };
 use tauri::{plugin::PluginHandle, AppHandle, Emitter, Manager, Runtime};
+#[cfg(not(any(target_os = "android", target_os = "ios", target_os = "macos")))]
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::AsyncWriteExt;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::TcpStream,
     process::{Child, Command},
     sync::Mutex,
@@ -31,9 +33,13 @@ const CONFIG_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 const DESKTOP_STOP_TIMEOUT: Duration = Duration::from_secs(8);
 const DESKTOP_STATS_TIMEOUT: Duration = Duration::from_secs(3);
 const PORT_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+#[cfg(target_os = "macos")]
+const MACOS_ADMIN_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub struct SingBoxEngine {
     child: Mutex<Option<Child>>,
+    #[cfg(target_os = "macos")]
+    privileged_pid: Mutex<Option<u32>>,
     olcrtc: Mutex<Option<OlcRtcRuntime>>,
     #[cfg(any(target_os = "android", target_os = "ios"))]
     mobile_connected: Mutex<bool>,
@@ -45,6 +51,8 @@ impl Default for SingBoxEngine {
     fn default() -> Self {
         Self {
             child: Mutex::new(None),
+            #[cfg(target_os = "macos")]
+            privileged_pid: Mutex::new(None),
             olcrtc: Mutex::new(None),
             #[cfg(any(target_os = "android", target_os = "ios"))]
             mobile_connected: Mutex::new(false),
@@ -79,9 +87,18 @@ impl SingBoxEngine {
         app: &AppHandle<R>,
         options: &ConnectOptions,
     ) -> Result<Vec<String>> {
+        #[cfg(target_os = "macos")]
+        let guard = self.child.lock().await;
+        #[cfg(not(target_os = "macos"))]
         let mut guard = self.child.lock().await;
         if guard.is_some() {
             return Err(VpnError::AlreadyRunning);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            if self.privileged_pid.lock().await.is_some() {
+                return Err(VpnError::AlreadyRunning);
+            }
         }
 
         let warnings = platform::check_platform_requirements()?;
@@ -92,6 +109,8 @@ impl SingBoxEngine {
         let binary = resolve_core_binary(app)?;
 
         check_config(&binary, &config_path).await?;
+        #[cfg(target_os = "macos")]
+        crate::macos_vpn::install_vpn_profile()?;
         cleanup_desktop_artifacts(&config_path).await?;
 
         let mut olcrtc_runtime = if matches!(options.profile.protocol, VpnProtocol::OlcRtc) {
@@ -103,45 +122,75 @@ impl SingBoxEngine {
             None
         };
 
-        let mut command = Command::new(&binary);
-        command.arg("run").arg("-c").arg(&config_path);
-        command.kill_on_drop(true);
-        hide_tokio_command_window(&mut command);
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        match command.spawn() {
-            Ok(mut child) => {
-                pipe_logs(app, child.stdout.take(), "stdout");
-                pipe_logs(app, child.stderr.take(), "stderr");
-                if let Some(status) = wait_for_desktop_readiness(&mut child).await? {
+        #[cfg(target_os = "macos")]
+        {
+            let pid = start_macos_privileged_sing_box(app, &binary, &config_path).await?;
+            match wait_for_macos_privileged_readiness(pid, &config_path).await {
+                Ok(()) => {
+                    *self.privileged_pid.lock().await = Some(pid);
+                    *self.olcrtc.lock().await = olcrtc_runtime;
+                    self.start_stats_polling(app).await;
+                    let _ = app.emit(
+                        "vpn:log",
+                        format!(
+                            "sing-box started as administrator with config {}",
+                            config_path.display()
+                        ),
+                    );
+                    return Ok(warnings);
+                }
+                Err(error) => {
                     if let Some(runtime) = olcrtc_runtime.take() {
                         runtime.stop().await;
                     }
-                    let _ = cleanup_desktop_artifacts(&config_path).await;
-                    return Err(VpnError::Engine(format!(
+                    let _ = stop_macos_privileged_sing_box(Some(pid), &config_path).await;
+                    return Err(error);
+                }
+            }
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let mut command = Command::new(&binary);
+            command.arg("run").arg("-c").arg(&config_path);
+            command.kill_on_drop(true);
+            hide_tokio_command_window(&mut command);
+            command
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+
+            match command.spawn() {
+                Ok(mut child) => {
+                    pipe_logs(app, child.stdout.take(), "stdout");
+                    pipe_logs(app, child.stderr.take(), "stderr");
+                    if let Some(status) = wait_for_desktop_readiness(&mut child).await? {
+                        if let Some(runtime) = olcrtc_runtime.take() {
+                            runtime.stop().await;
+                        }
+                        let _ = cleanup_desktop_artifacts(&config_path).await;
+                        return Err(VpnError::Engine(format!(
                         "sing-box exited during startup with status {status}. Check vpn logs for details."
                     )));
+                    }
+                    *guard = Some(child);
+                    *self.olcrtc.lock().await = olcrtc_runtime;
+                    self.start_stats_polling(app).await;
+                    let _ = app.emit(
+                        "vpn:log",
+                        format!("sing-box started with config {}", config_path.display()),
+                    );
+                    Ok(warnings)
                 }
-                *guard = Some(child);
-                *self.olcrtc.lock().await = olcrtc_runtime;
-                self.start_stats_polling(app).await;
-                let _ = app.emit(
-                    "vpn:log",
-                    format!("sing-box started with config {}", config_path.display()),
-                );
-                Ok(warnings)
-            }
-            Err(error) => {
-                if let Some(runtime) = olcrtc_runtime.take() {
-                    runtime.stop().await;
+                Err(error) => {
+                    if let Some(runtime) = olcrtc_runtime.take() {
+                        runtime.stop().await;
+                    }
+                    Err(VpnError::Engine(format!(
+                        "failed to start bundled sing-box core at {}: {error}",
+                        binary.display()
+                    )))
                 }
-                Err(VpnError::Engine(format!(
-                    "failed to start bundled sing-box core at {}: {error}",
-                    binary.display()
-                )))
             }
         }
     }
@@ -203,19 +252,27 @@ impl SingBoxEngine {
             return Ok((false, None));
         };
 
-        // If the bridge is not ready, it might return an error. 
+        // If the bridge is not ready, it might return an error.
         // We retry up to 3 times with increasing delay.
         let mut last_error = None;
         for i in 0..3 {
-            match mobile.run_mobile_plugin_async::<NativeStatusResponse>("getNativeVpnStatus", ()).await {
+            match mobile
+                .run_mobile_plugin_async::<NativeStatusResponse>("getNativeVpnStatus", ())
+                .await
+            {
                 Ok(response) => {
                     if response.established {
                         *self.mobile_connected.lock().await = true;
-                        if let (Some(up), Some(down)) = (response.uploaded_bytes, response.downloaded_bytes) {
-                            let _ = app.emit("vpn:stats", TrafficStats {
-                                uploaded_bytes: up,
-                                downloaded_bytes: down,
-                            });
+                        if let (Some(up), Some(down)) =
+                            (response.uploaded_bytes, response.downloaded_bytes)
+                        {
+                            let _ = app.emit(
+                                "vpn:stats",
+                                TrafficStats {
+                                    uploaded_bytes: up,
+                                    downloaded_bytes: down,
+                                },
+                            );
                         }
                     } else {
                         *self.mobile_connected.lock().await = false;
@@ -256,6 +313,17 @@ impl SingBoxEngine {
     async fn stop_desktop<R: Runtime>(&self, app: &AppHandle<R>) -> Result<()> {
         let mut guard = self.child.lock().await;
         self.stop_stats_polling().await;
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(pid) = self.privileged_pid.lock().await.take() {
+                if let Some(runtime) = self.olcrtc.lock().await.take() {
+                    runtime.stop().await;
+                }
+                stop_macos_privileged_sing_box(Some(pid), &runtime_config_path(app)?).await?;
+                let _ = app.emit("vpn:log", "sing-box administrator process stopped");
+                return Ok(());
+            }
+        }
         let Some(mut child) = guard.take() else {
             cleanup_desktop_artifacts(&runtime_config_path(app)?).await?;
             return Err(VpnError::NotRunning);
@@ -347,8 +415,8 @@ impl SingBoxEngine {
                             }
                         },
                         Err(error) => {
-                            let _ =
-                                app.emit("vpn:log", format!("failed to query traffic stats: {error}"));
+                            let _ = app
+                                .emit("vpn:log", format!("failed to query traffic stats: {error}"));
                         }
                     }
                 }
@@ -365,7 +433,7 @@ impl SingBoxEngine {
         if let Ok(mut guard) = self.stats_task.lock() {
             if let Some(task) = guard.take() {
                 task.abort();
-                // On some runtimes, task doesn't immediately stop. 
+                // On some runtimes, task doesn't immediately stop.
                 // We don't wait here because it's async, but we've removed it from the state.
             }
         }
@@ -453,7 +521,7 @@ async fn check_config(binary: &Path, config_path: &Path) -> Result<()> {
     )))
 }
 
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[cfg(not(any(target_os = "android", target_os = "ios", target_os = "macos")))]
 async fn wait_for_desktop_readiness(child: &mut Child) -> Result<Option<std::process::ExitStatus>> {
     for _ in 0..20 {
         if let Some(status) = child.try_wait().map_err(|error| {
@@ -462,9 +530,7 @@ async fn wait_for_desktop_readiness(child: &mut Child) -> Result<Option<std::pro
             return Ok(Some(status));
         }
 
-        if tcp_connects("127.0.0.1:2080").await
-            || tcp_connects(config::CLASH_API_ADDR).await
-        {
+        if tcp_connects("127.0.0.1:2080").await || tcp_connects(config::CLASH_API_ADDR).await {
             sleep(Duration::from_millis(700)).await;
             if let Some(status) = child.try_wait().map_err(|error| {
                 VpnError::Engine(format!("failed to inspect sing-box process: {error}"))
@@ -477,9 +543,10 @@ async fn wait_for_desktop_readiness(child: &mut Child) -> Result<Option<std::pro
         sleep(Duration::from_millis(300)).await;
     }
 
-    if let Some(status) = child.try_wait().map_err(|error| {
-        VpnError::Engine(format!("failed to inspect sing-box process: {error}"))
-    })? {
+    if let Some(status) = child
+        .try_wait()
+        .map_err(|error| VpnError::Engine(format!("failed to inspect sing-box process: {error}")))?
+    {
         return Ok(Some(status));
     }
 
@@ -490,9 +557,13 @@ async fn wait_for_desktop_readiness(child: &mut Child) -> Result<Option<std::pro
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 async fn tcp_connects(addr: &str) -> bool {
-    matches!(timeout(PORT_PROBE_TIMEOUT, TcpStream::connect(addr)).await, Ok(Ok(_)))
+    matches!(
+        timeout(PORT_PROBE_TIMEOUT, TcpStream::connect(addr)).await,
+        Ok(Ok(_))
+    )
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios", target_os = "macos")))]
 fn pipe_logs<R, T>(app: &AppHandle<R>, stream: Option<T>, label: &'static str)
 where
     R: Runtime,
@@ -534,6 +605,173 @@ pub(crate) fn runtime_config_path<R: Runtime>(app: &AppHandle<R>) -> Result<Path
         .app_local_data_dir()
         .map_err(|error| VpnError::Platform(format!("app data directory unavailable: {error}")))?;
     Ok(dir.join("sing-box.generated.json"))
+}
+
+#[cfg(target_os = "macos")]
+async fn start_macos_privileged_sing_box<R: Runtime>(
+    app: &AppHandle<R>,
+    binary: &Path,
+    config_path: &Path,
+) -> Result<u32> {
+    let log_path = macos_privileged_log_path(config_path);
+    let _ = std::fs::remove_file(&log_path);
+    let shell_script = format!(
+        "cd /; {} run -c {} >> {} 2>&1 < /dev/null & echo $!",
+        shell_quote(&binary.to_string_lossy()),
+        shell_quote(&config_path.to_string_lossy()),
+        shell_quote(&log_path.to_string_lossy())
+    );
+    let _ = app.emit(
+        "vpn:log",
+        "macOS administrator approval is required to start the system tunnel",
+    );
+    let output = run_macos_admin_script(&shell_script).await?;
+    output
+        .lines()
+        .rev()
+        .find_map(|line| line.trim().parse::<u32>().ok())
+        .ok_or_else(|| {
+            VpnError::Engine(format!(
+                "failed to read privileged sing-box pid from osascript output: {}",
+                output.trim()
+            ))
+        })
+}
+
+#[cfg(target_os = "macos")]
+async fn wait_for_macos_privileged_readiness(pid: u32, config_path: &Path) -> Result<()> {
+    for _ in 0..20 {
+        if tcp_connects("127.0.0.1:2080").await || tcp_connects(config::CLASH_API_ADDR).await {
+            return Ok(());
+        }
+
+        if !process_exists(pid).await {
+            return Err(VpnError::Engine(format!(
+                "sing-box administrator process exited during startup. {}",
+                macos_privileged_log_tail(config_path)
+            )));
+        }
+
+        sleep(Duration::from_millis(500)).await;
+    }
+
+    Err(VpnError::Engine(format!(
+        "sing-box did not open local proxy ports during startup. {}",
+        macos_privileged_log_tail(config_path)
+    )))
+}
+
+#[cfg(target_os = "macos")]
+async fn stop_macos_privileged_sing_box(pid: Option<u32>, config_path: &Path) -> Result<()> {
+    let mut commands = Vec::new();
+    if let Some(pid) = pid {
+        commands.push(format!("kill {}", pid));
+    }
+    commands.push(format!(
+        "pkill -f {}",
+        shell_quote(&format!("sing-box.*{}", config_path.display()))
+    ));
+    commands.push("lsof -tiTCP:2080 -sTCP:LISTEN -a -c sing-box | xargs kill".into());
+    let shell_script = format!("{} 2>/dev/null || true", commands.join("; "));
+    run_macos_admin_script(&shell_script).await.map(|_| ())
+}
+
+#[cfg(target_os = "macos")]
+async fn macos_has_sing_box_listener() -> bool {
+    Command::new("lsof")
+        .args(["-tiTCP:2080", "-sTCP:LISTEN", "-a", "-c", "sing-box"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_has_sing_box_listener_blocking() -> bool {
+    std::process::Command::new("lsof")
+        .args(["-tiTCP:2080", "-sTCP:LISTEN", "-a", "-c", "sing-box"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+async fn run_macos_admin_script(shell_script: &str) -> Result<String> {
+    let script = format!(
+        "do shell script {} with administrator privileges",
+        applescript_string(shell_script)
+    );
+    let output = timeout(
+        MACOS_ADMIN_TIMEOUT,
+        Command::new("osascript").arg("-e").arg(script).output(),
+    )
+    .await
+    .map_err(|_| VpnError::Engine("administrator approval timed out".into()))?
+    .map_err(|error| {
+        VpnError::Engine(format!("failed to request administrator approval: {error}"))
+    })?;
+
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).to_string());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(VpnError::Engine(format!(
+        "administrator command failed: {}",
+        stderr.trim()
+    )))
+}
+
+#[cfg(target_os = "macos")]
+async fn process_exists(pid: u32) -> bool {
+    Command::new("ps")
+        .arg("-p")
+        .arg(pid.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_privileged_log_path(config_path: &Path) -> PathBuf {
+    config_path.with_file_name("sing-box.macos.log")
+}
+
+#[cfg(target_os = "macos")]
+fn macos_privileged_log_tail(config_path: &Path) -> String {
+    let log_path = macos_privileged_log_path(config_path);
+    let Ok(contents) = std::fs::read_to_string(&log_path) else {
+        return format!("Log file: {}", log_path.display());
+    };
+    let tail = contents
+        .lines()
+        .rev()
+        .take(12)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("Log file: {}\n{}", log_path.display(), tail)
+}
+
+#[cfg(target_os = "macos")]
+fn shell_quote(value: impl AsRef<str>) -> String {
+    format!("'{}'", value.as_ref().replace('\'', "'\\''"))
+}
+
+#[cfg(target_os = "macos")]
+fn applescript_string(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 #[cfg(target_os = "windows")]
@@ -591,11 +829,11 @@ foreach ($index in $indices.Keys) {
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     hide_std_command_window(&mut command);
-    let status = command
-        .status()
-        .map_err(|error| {
-            VpnError::Engine(format!("failed to clean up stale Windows TUN state: {error}"))
-        })?;
+    let status = command.status().map_err(|error| {
+        VpnError::Engine(format!(
+            "failed to clean up stale Windows TUN state: {error}"
+        ))
+    })?;
 
     if status.success() {
         Ok(())
@@ -606,12 +844,88 @@ foreach ($index in $indices.Keys) {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+async fn cleanup_desktop_artifacts(config_path: &Path) -> Result<()> {
+    if macos_has_sing_box_listener().await {
+        stop_macos_privileged_sing_box(None, config_path).await?;
+        sleep(Duration::from_millis(300)).await;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+async fn cleanup_desktop_artifacts(config_path: &Path) -> Result<()> {
+    cleanup_desktop_artifacts_blocking(config_path)?;
+    sleep(Duration::from_millis(300)).await;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn cleanup_desktop_artifacts_blocking(_config_path: &Path) -> Result<()> {
+    let output = std::process::Command::new("lsof")
+        .args(["-tiTCP:2080", "-sTCP:LISTEN", "-a", "-c", "sing-box"])
+        .stdin(Stdio::null())
+        .output();
+
+    let Ok(output) = output else {
+        return Ok(());
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for pid in stdout.lines().map(str::trim).filter(|pid| !pid.is_empty()) {
+        let _ = std::process::Command::new("kill")
+            .arg(pid)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn cleanup_desktop_artifacts_blocking(config_path: &Path) -> Result<()> {
+    if !macos_has_sing_box_listener_blocking() {
+        return Ok(());
+    }
+
+    let shell_script = format!(
+        "pkill -f {} 2>/dev/null || true; lsof -tiTCP:2080 -sTCP:LISTEN -a -c sing-box | xargs kill 2>/dev/null || true",
+        shell_quote(&format!("sing-box.*{}", config_path.display()))
+    );
+    let script = format!(
+        "do shell script {} with administrator privileges",
+        applescript_string(&shell_script)
+    );
+    let status = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| {
+            VpnError::Engine(format!(
+                "failed to request administrator cleanup on macOS: {error}"
+            ))
+        })?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(VpnError::Engine(format!(
+            "macOS administrator cleanup exited with status {status}"
+        )))
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
 async fn cleanup_desktop_artifacts(_config_path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
 pub(crate) fn cleanup_desktop_artifacts_blocking(_config_path: &Path) -> Result<()> {
     Ok(())
 }
@@ -631,6 +945,7 @@ fn hide_std_command_window(command: &mut std::process::Command) {
 }
 
 #[cfg(not(target_os = "windows"))]
+#[allow(dead_code)]
 fn hide_std_command_window(_command: &mut std::process::Command) {}
 
 fn resolve_core_binary<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf> {
