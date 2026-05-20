@@ -71,10 +71,7 @@ pub async fn status<R: Runtime>(
     state: State<'_, VpnState<R>>,
 ) -> Result<ConnectionStatus> {
     let _ = app;
-    let status = state.status.lock().await;
-
-    #[cfg(any(target_os = "android", target_os = "ios"))]
-    let mut status = status; 
+    let mut status = state.status.lock().await;
 
     #[cfg(any(target_os = "android", target_os = "ios"))]
     {
@@ -92,6 +89,26 @@ pub async fn status<R: Runtime>(
                     }
                 }
             }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        match crate::macos_vpn::is_vpn_profile_connected() {
+            Ok(true) if status.phase == ConnectionPhase::Disconnected => {
+                status.phase = ConnectionPhase::Connected;
+                status.message = Some("Connected (Recovered)".into());
+            }
+            Ok(false)
+                if matches!(
+                    status.phase,
+                    ConnectionPhase::Connected | ConnectionPhase::Connecting
+                ) =>
+            {
+                status.phase = ConnectionPhase::Disconnected;
+                status.message = None;
+            }
+            _ => {}
         }
     }
 

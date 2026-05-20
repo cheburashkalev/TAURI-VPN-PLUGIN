@@ -35,11 +35,15 @@ const DESKTOP_STATS_TIMEOUT: Duration = Duration::from_secs(3);
 const PORT_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 #[cfg(target_os = "macos")]
 const MACOS_ADMIN_TIMEOUT: Duration = Duration::from_secs(300);
+#[cfg(target_os = "macos")]
+const MACOS_SYSTEM_TUNNEL_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub struct SingBoxEngine {
     child: Mutex<Option<Child>>,
     #[cfg(target_os = "macos")]
     privileged_pid: Mutex<Option<u32>>,
+    #[cfg(target_os = "macos")]
+    macos_system_connected: Mutex<bool>,
     olcrtc: Mutex<Option<OlcRtcRuntime>>,
     #[cfg(any(target_os = "android", target_os = "ios"))]
     mobile_connected: Mutex<bool>,
@@ -53,6 +57,8 @@ impl Default for SingBoxEngine {
             child: Mutex::new(None),
             #[cfg(target_os = "macos")]
             privileged_pid: Mutex::new(None),
+            #[cfg(target_os = "macos")]
+            macos_system_connected: Mutex::new(false),
             olcrtc: Mutex::new(None),
             #[cfg(any(target_os = "android", target_os = "ios"))]
             mobile_connected: Mutex::new(false),
@@ -99,6 +105,9 @@ impl SingBoxEngine {
             if self.privileged_pid.lock().await.is_some() {
                 return Err(VpnError::AlreadyRunning);
             }
+            if *self.macos_system_connected.lock().await {
+                return Err(VpnError::AlreadyRunning);
+            }
         }
 
         let warnings = platform::check_platform_requirements()?;
@@ -124,29 +133,26 @@ impl SingBoxEngine {
 
         #[cfg(target_os = "macos")]
         {
-            let pid = start_macos_privileged_sing_box(app, &binary, &config_path).await?;
-            match wait_for_macos_privileged_readiness(pid, &config_path).await {
-                Ok(()) => {
-                    *self.privileged_pid.lock().await = Some(pid);
-                    *self.olcrtc.lock().await = olcrtc_runtime;
-                    self.start_stats_polling(app).await;
-                    let _ = app.emit(
-                        "vpn:log",
-                        format!(
-                            "sing-box started as administrator with config {}",
-                            config_path.display()
-                        ),
-                    );
-                    return Ok(warnings);
+            if let Err(error) =
+                crate::macos_vpn::start_vpn_profile(&config_text, Some(&options.profile.id.to_string()))
+            {
+                if let Some(runtime) = olcrtc_runtime.take() {
+                    runtime.stop().await;
                 }
-                Err(error) => {
-                    if let Some(runtime) = olcrtc_runtime.take() {
-                        runtime.stop().await;
-                    }
-                    let _ = stop_macos_privileged_sing_box(Some(pid), &config_path).await;
-                    return Err(error);
-                }
+                return Err(error);
             }
+            if let Err(error) = wait_for_macos_system_tunnel().await {
+                if let Some(runtime) = olcrtc_runtime.take() {
+                    runtime.stop().await;
+                }
+                let _ = crate::macos_vpn::stop_vpn_profile();
+                return Err(error);
+            }
+            *self.macos_system_connected.lock().await = true;
+            *self.olcrtc.lock().await = olcrtc_runtime;
+            self.start_stats_polling(app).await;
+            let _ = app.emit("vpn:log", "macOS system VPN tunnel start requested");
+            return Ok(warnings);
         }
 
         #[cfg(not(target_os = "macos"))]
@@ -315,6 +321,16 @@ impl SingBoxEngine {
         self.stop_stats_polling().await;
         #[cfg(target_os = "macos")]
         {
+            if *self.macos_system_connected.lock().await {
+                if let Some(runtime) = self.olcrtc.lock().await.take() {
+                    runtime.stop().await;
+                }
+                crate::macos_vpn::stop_vpn_profile()?;
+                *self.macos_system_connected.lock().await = false;
+                cleanup_desktop_artifacts(&runtime_config_path(app)?).await?;
+                let _ = app.emit("vpn:log", "macOS system VPN tunnel stop requested");
+                return Ok(());
+            }
             if let Some(pid) = self.privileged_pid.lock().await.take() {
                 if let Some(runtime) = self.olcrtc.lock().await.take() {
                     runtime.stop().await;
@@ -492,6 +508,30 @@ struct NativeStatusResponse {
 struct ConnectionsStats {
     upload_total: u64,
     download_total: u64,
+}
+
+#[cfg(target_os = "macos")]
+async fn wait_for_macos_system_tunnel() -> Result<()> {
+    let start = std::time::Instant::now();
+    let mut last_error = None;
+
+    while start.elapsed() < MACOS_SYSTEM_TUNNEL_TIMEOUT {
+        match crate::macos_vpn::is_vpn_profile_connected() {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(error) => last_error = Some(error.to_string()),
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+
+    let detail = last_error
+        .map(|error| format!(" Last status error: {error}"))
+        .unwrap_or_default();
+    Err(VpnError::Platform(format!(
+        "macOS system VPN tunnel did not become connected within {} seconds.{}",
+        MACOS_SYSTEM_TUNNEL_TIMEOUT.as_secs(),
+        detail
+    )))
 }
 
 async fn check_config(binary: &Path, config_path: &Path) -> Result<()> {

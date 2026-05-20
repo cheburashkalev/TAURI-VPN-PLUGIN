@@ -3,6 +3,7 @@ import Libbox
 import Network
 import NetworkExtension
 
+@objc(PacketTunnelProvider)
 public final class PacketTunnelProvider: NEPacketTunnelProvider {
   fileprivate var commandServer: LibboxCommandServer?
   private lazy var platformInterface = TunnelPlatformInterface(tunnel: self)
@@ -11,11 +12,14 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
     options: [String: NSObject]?,
     completionHandler: @escaping (Error?) -> Void
   ) {
+    TunnelDebug.log("startTunnel entered; option keys=\(options?.keys.sorted().joined(separator: ",") ?? "nil")")
     Task {
       do {
         try await startTunnelAsync(options: options)
+        TunnelDebug.log("startTunnel completed")
         completionHandler(nil)
       } catch {
+        TunnelDebug.log("startTunnel failed: \(error.localizedDescription)")
         completionHandler(error)
       }
     }
@@ -25,6 +29,7 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
     with reason: NEProviderStopReason,
     completionHandler: @escaping () -> Void
   ) {
+    TunnelDebug.log("stopTunnel reason=\(reason.rawValue)")
     do {
       try commandServer?.closeService()
     } catch {
@@ -40,8 +45,10 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
     guard let configContent = options?["configContent"] as? String, !configContent.isEmpty else {
       throw TunnelError("missing configContent")
     }
+    TunnelDebug.log("configContent received; bytes=\(configContent.utf8.count)")
 
     let paths = try TunnelPaths()
+    TunnelDebug.log("paths base=\(paths.basePath) working=\(paths.workingPath) temp=\(paths.tempPath)")
     var setupError: NSError?
     let setupOptions = LibboxSetupOptions()
     setupOptions.basePath = paths.basePath
@@ -51,6 +58,7 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
     guard LibboxSetup(setupOptions, &setupError) else {
       throw setupError ?? TunnelError("libbox setup failed")
     }
+    TunnelDebug.log("libbox setup completed")
 
     var stderrError: NSError?
     LibboxRedirectStderr(paths.stderrPath, &stderrError)
@@ -65,11 +73,48 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
       throw serverError ?? TunnelError("failed to create libbox command server")
     }
     commandServer = server
+    TunnelDebug.log("libbox command server created")
 
     try server.start()
+    TunnelDebug.log("libbox command server started")
 
     let overrideOptions = LibboxOverrideOptions()
     try server.startOrReloadService(configContent, options: overrideOptions)
+    TunnelDebug.log("libbox service started")
+  }
+}
+
+private enum TunnelDebug {
+  private static let queue = DispatchQueue(label: "com.kostravpn.tunnel.debug")
+
+  static func log(_ message: String) {
+    let line = "\(Date()) KOSTRA Tunnel: \(message)\n"
+    NSLog("%@", line)
+    queue.async {
+      let manager = FileManager.default
+      let logDirectories = [
+        manager.urls(for: .libraryDirectory, in: .userDomainMask).first?.appendingPathComponent("Logs", isDirectory: true),
+        URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+      ].compactMap { $0 }
+
+      for directory in logDirectories {
+        do {
+          try manager.createDirectory(at: directory, withIntermediateDirectories: true)
+          let file = directory.appendingPathComponent("KostraVpnTunnel.log")
+          if !manager.fileExists(atPath: file.path) {
+            manager.createFile(atPath: file.path, contents: nil)
+          }
+          let handle = try FileHandle(forWritingTo: file)
+          try handle.seekToEnd()
+          if let data = line.data(using: .utf8) {
+            try handle.write(contentsOf: data)
+          }
+          try handle.close()
+        } catch {
+          NSLog("KOSTRA Tunnel: debug log write failed: %@", error.localizedDescription)
+        }
+      }
+    }
   }
 }
 
@@ -115,6 +160,7 @@ private final class TunnelPlatformInterface: NSObject, LibboxPlatformInterfacePr
   }
 
   func openTun(_ options: LibboxTunOptionsProtocol?, ret0_: UnsafeMutablePointer<Int32>?) throws {
+    TunnelDebug.log("openTun entered")
     guard let tunnel else {
       throw TunnelError("packet tunnel provider is gone")
     }
@@ -126,13 +172,16 @@ private final class TunnelPlatformInterface: NSObject, LibboxPlatformInterfacePr
     }
 
     let settings = try makeNetworkSettings(options: options)
+    TunnelDebug.log("network settings prepared")
     try runBlocking {
       try await tunnel.setTunnelNetworkSettings(settings)
     }
     networkSettings = settings
+    TunnelDebug.log("network settings applied")
 
     if let fd = tunnel.packetFlow.value(forKeyPath: "socket.fileDescriptor") as? Int32 {
       ret0_.pointee = fd
+      TunnelDebug.log("openTun completed with packetFlow fd=\(fd)")
       return
     }
 
@@ -141,6 +190,7 @@ private final class TunnelPlatformInterface: NSObject, LibboxPlatformInterfacePr
       throw TunnelError("missing tunnel file descriptor")
     }
     ret0_.pointee = fd
+    TunnelDebug.log("openTun completed with libbox fd=\(fd)")
   }
 
   func usePlatformAutoDetectControl() -> Bool {

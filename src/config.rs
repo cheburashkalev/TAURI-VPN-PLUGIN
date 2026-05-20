@@ -35,6 +35,29 @@ pub fn generate_sing_box_config(options: &ConnectOptions) -> Result<Value> {
     let tun_stack = tun_stack_for_profile(&options.profile);
     let tun_mtu = tun_mtu_for_profile(&options.profile);
     let dns_servers = dns_servers_for_options(options);
+    let inbounds = vec![json!({
+        "type": "tun",
+        "tag": "tun-in",
+        "address": ["198.18.0.1/30"],
+        "mtu": tun_mtu,
+        "route_exclude_address": LOCAL_NETWORK_CIDRS,
+        "auto_route": true,
+        "strict_route": options.kill_switch,
+        "endpoint_independent_nat": true,
+        "udp_timeout": "5m",
+        "stack": tun_stack
+    })];
+
+    #[cfg(not(target_os = "macos"))]
+    let mut inbounds = inbounds;
+
+    #[cfg(not(target_os = "macos"))]
+    inbounds.push(json!({
+        "type": "mixed",
+        "tag": "mixed-in",
+        "listen": "127.0.0.1",
+        "listen_port": 2080
+    }));
 
     Ok(json!({
         "log": {
@@ -46,26 +69,7 @@ pub fn generate_sing_box_config(options: &ConnectOptions) -> Result<Value> {
             "strategy": dns_strategy(options.dns.strategy),
             "final": "dns-0"
         },
-        "inbounds": [
-            {
-                "type": "tun",
-                "tag": "tun-in",
-                "address": ["198.18.0.1/30"],
-                "mtu": tun_mtu,
-                "route_exclude_address": LOCAL_NETWORK_CIDRS,
-                "auto_route": true,
-                "strict_route": options.kill_switch,
-                "endpoint_independent_nat": true,
-                "udp_timeout": "5m",
-                "stack": tun_stack
-            },
-            {
-                "type": "mixed",
-                "tag": "mixed-in",
-                "listen": "127.0.0.1",
-                "listen_port": 2080
-            }
-        ],
+        "inbounds": inbounds,
         "outbounds": [
             outbound,
             { "type": "direct", "tag": "direct" },
