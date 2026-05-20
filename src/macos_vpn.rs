@@ -1,8 +1,14 @@
 use crate::{Result, VpnError};
 use block2::RcBlock;
-use objc2::{rc::Retained, runtime::{AnyObject, ProtocolObject}, ClassType};
-use objc2_foundation::{NSArray, NSDictionary, NSError, NSObjectProtocol, NSString, NSCopying};
-use objc2_network_extension::{NETunnelProviderManager, NETunnelProviderProtocol, NETunnelProviderSession, NEVPNStatus};
+use objc2::{
+    rc::Retained,
+    runtime::{AnyObject, ProtocolObject},
+    ClassType,
+};
+use objc2_foundation::{NSArray, NSCopying, NSDictionary, NSError, NSObjectProtocol, NSString};
+use objc2_network_extension::{
+    NETunnelProviderManager, NETunnelProviderProtocol, NETunnelProviderSession, NEVPNStatus,
+};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -158,7 +164,9 @@ fn load_manager() -> Result<Retained<NETunnelProviderManager>> {
             }
 
             let manager = unsafe { find_manager(managers, &description) };
-            let _ = tx.send(manager.ok_or_else(|| "KOSTRA VPN profile was not found in macOS VPN settings".to_string()));
+            let _ = tx.send(manager.ok_or_else(|| {
+                "KOSTRA VPN profile was not found in macOS VPN settings".to_string()
+            }));
         },
     );
 
@@ -167,7 +175,9 @@ fn load_manager() -> Result<Retained<NETunnelProviderManager>> {
     }
 
     rx.recv_timeout(Duration::from_secs(30))
-        .map_err(|_| VpnError::Platform("timed out while loading KOSTRA VPN from macOS VPN settings".into()))?
+        .map_err(|_| {
+            VpnError::Platform("timed out while loading KOSTRA VPN from macOS VPN settings".into())
+        })?
         .map_err(VpnError::Platform)
 }
 

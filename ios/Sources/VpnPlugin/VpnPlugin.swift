@@ -42,7 +42,8 @@ struct StatusPayload: Encodable {
         manager.isEnabled = true
         let protocolConfiguration = manager.protocolConfiguration as? NETunnelProviderProtocol
         protocolConfiguration?.providerConfiguration = [
-          "activeProfileId": args.profileId ?? ""
+          "activeProfileId": args.profileId ?? "",
+          "configContent": args.configJson
         ]
         manager.saveToPreferences { error in
           if let error {

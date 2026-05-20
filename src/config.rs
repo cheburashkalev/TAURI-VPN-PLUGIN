@@ -381,10 +381,12 @@ fn add_tls(profile: &VpnProfile, outbound: &mut Value) {
     if let Some(tls) = &profile.tls {
         if tls.enabled {
             let utls = if supports_utls(profile.protocol) {
-                tls.fingerprint.as_ref().map(|fingerprint| json!({
-                    "enabled": true,
-                    "fingerprint": fingerprint
-                }))
+                tls.fingerprint.as_ref().map(|fingerprint| {
+                    json!({
+                        "enabled": true,
+                        "fingerprint": fingerprint
+                    })
+                })
             } else {
                 None
             };
@@ -400,10 +402,16 @@ fn add_tls(profile: &VpnProfile, outbound: &mut Value) {
 
     if let Some(reality) = &profile.reality {
         let utls = if supports_utls(profile.protocol) {
-            profile.tls.as_ref().and_then(|tls| tls.fingerprint.as_ref()).map(|fingerprint| json!({
-                "enabled": true,
-                "fingerprint": fingerprint
-            }))
+            profile
+                .tls
+                .as_ref()
+                .and_then(|tls| tls.fingerprint.as_ref())
+                .map(|fingerprint| {
+                    json!({
+                        "enabled": true,
+                        "fingerprint": fingerprint
+                    })
+                })
         } else {
             None
         };

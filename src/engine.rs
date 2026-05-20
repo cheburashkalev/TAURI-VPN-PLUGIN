@@ -16,9 +16,9 @@ use std::{
     sync::Mutex as StdMutex,
 };
 use tauri::{plugin::PluginHandle, AppHandle, Emitter, Manager, Runtime};
+use tokio::io::AsyncWriteExt;
 #[cfg(not(any(target_os = "android", target_os = "ios", target_os = "macos")))]
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::io::AsyncWriteExt;
 use tokio::{
     net::TcpStream,
     process::{Child, Command},
@@ -37,6 +37,8 @@ const PORT_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 const MACOS_ADMIN_TIMEOUT: Duration = Duration::from_secs(300);
 #[cfg(target_os = "macos")]
 const MACOS_SYSTEM_TUNNEL_TIMEOUT: Duration = Duration::from_secs(20);
+#[cfg(any(target_os = "android", target_os = "ios"))]
+const MOBILE_SYSTEM_TUNNEL_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub struct SingBoxEngine {
     child: Mutex<Option<Child>>,
@@ -137,9 +139,10 @@ impl SingBoxEngine {
 
         #[cfg(target_os = "macos")]
         {
-            if let Err(error) =
-                crate::macos_vpn::start_vpn_profile(&config_text, Some(&options.profile.id.to_string()))
-            {
+            if let Err(error) = crate::macos_vpn::start_vpn_profile(
+                &config_text,
+                Some(&options.profile.id.to_string()),
+            ) {
                 if let Some(runtime) = olcrtc_runtime.take() {
                     runtime.stop().await;
                 }
@@ -248,8 +251,9 @@ impl SingBoxEngine {
             .await
             .map_err(|error| VpnError::Platform(format!("native VPN start failed: {error}")))?;
 
+        wait_for_mobile_system_tunnel(app, mobile).await?;
         *self.mobile_connected.lock().await = true;
-        let _ = app.emit("vpn:log", "native mobile VPN start requested");
+        let _ = app.emit("vpn:log", "native mobile VPN tunnel connected");
         Ok(warnings)
     }
 
@@ -459,6 +463,46 @@ impl SingBoxEngine {
             }
         }
     }
+}
+
+#[cfg(any(target_os = "android", target_os = "ios"))]
+async fn wait_for_mobile_system_tunnel<R: Runtime>(
+    app: &AppHandle<R>,
+    mobile: &PluginHandle<R>,
+) -> Result<()> {
+    let start = std::time::Instant::now();
+    let mut last_error = None;
+
+    while start.elapsed() < MOBILE_SYSTEM_TUNNEL_TIMEOUT {
+        match mobile
+            .run_mobile_plugin_async::<NativeStatusResponse>("getNativeVpnStatus", ())
+            .await
+        {
+            Ok(response) if response.established => return Ok(()),
+            Ok(_) => {}
+            Err(error) => {
+                last_error = Some(error);
+            }
+        }
+
+        sleep(Duration::from_millis(500)).await;
+    }
+
+    let detail = last_error
+        .map(|error| format!(" Last status error: {error}"))
+        .unwrap_or_default();
+    let _ = app.emit(
+        "vpn:log",
+        format!(
+            "native mobile VPN tunnel did not become connected within {} seconds",
+            MOBILE_SYSTEM_TUNNEL_TIMEOUT.as_secs()
+        ),
+    );
+    Err(VpnError::Platform(format!(
+        "mobile system VPN tunnel did not become connected within {} seconds.{}",
+        MOBILE_SYSTEM_TUNNEL_TIMEOUT.as_secs(),
+        detail
+    )))
 }
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]

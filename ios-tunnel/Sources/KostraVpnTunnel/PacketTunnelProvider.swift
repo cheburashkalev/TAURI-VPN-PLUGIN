@@ -42,7 +42,7 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
   }
 
   private func startTunnelAsync(options: [String: NSObject]?) async throws {
-    guard let configContent = options?["configContent"] as? String, !configContent.isEmpty else {
+    guard let configContent = configContent(from: options), !configContent.isEmpty else {
       throw TunnelError("missing configContent")
     }
     TunnelDebug.log("configContent received; bytes=\(configContent.utf8.count)")
@@ -81,6 +81,14 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
     let overrideOptions = LibboxOverrideOptions()
     try server.startOrReloadService(configContent, options: overrideOptions)
     TunnelDebug.log("libbox service started")
+  }
+
+  private func configContent(from options: [String: NSObject]?) -> String? {
+    if let optionConfig = options?["configContent"] as? String, !optionConfig.isEmpty {
+      return optionConfig
+    }
+    let tunnelProtocol = protocolConfiguration as? NETunnelProviderProtocol
+    return tunnelProtocol?.providerConfiguration?["configContent"] as? String
   }
 }
 

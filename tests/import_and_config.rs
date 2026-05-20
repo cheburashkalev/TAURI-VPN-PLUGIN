@@ -59,8 +59,14 @@ fn generates_sing_box_config() {
 fn generates_doh_dns_for_public_resolvers() {
     let config = generate_sing_box_config(&options("vless://11111111-1111-1111-1111-111111111111@example.com:443?security=tls&sni=example.com#Node")).unwrap();
     let servers = config["dns"]["servers"].as_array().unwrap();
-    let cloudflare = servers.iter().find(|server| server["tag"] == "dns-0").unwrap();
-    let google = servers.iter().find(|server| server["tag"] == "dns-1").unwrap();
+    let cloudflare = servers
+        .iter()
+        .find(|server| server["tag"] == "dns-0")
+        .unwrap();
+    let google = servers
+        .iter()
+        .find(|server| server["tag"] == "dns-1")
+        .unwrap();
 
     assert_eq!(cloudflare["type"], "https");
     assert_eq!(cloudflare["server"], "1.1.1.1");

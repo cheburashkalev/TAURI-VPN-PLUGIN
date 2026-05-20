@@ -75,19 +75,27 @@ pub async fn status<R: Runtime>(
 
     #[cfg(any(target_os = "android", target_os = "ios"))]
     {
-        if status.phase == ConnectionPhase::Disconnected {
-            if let Ok((established, profile_id)) =
-                state.engine.get_mobile_status(&app, state.mobile.as_ref()).await
-            {
-                if established {
+        if let Ok((established, profile_id)) = state
+            .engine
+            .get_mobile_status(&app, state.mobile.as_ref())
+            .await
+        {
+            if established {
+                if status.phase == ConnectionPhase::Disconnected {
                     status.phase = ConnectionPhase::Connected;
                     status.message = Some("Connected (Recovered)".into());
-                    if let Some(id_str) = profile_id {
-                        if let Ok(uuid) = uuid::Uuid::parse_str(&id_str) {
-                            status.active_profile_id = Some(uuid);
-                        }
+                }
+                if let Some(id_str) = profile_id {
+                    if let Ok(uuid) = uuid::Uuid::parse_str(&id_str) {
+                        status.active_profile_id = Some(uuid);
                     }
                 }
+            } else if matches!(
+                status.phase,
+                ConnectionPhase::Connected | ConnectionPhase::Connecting
+            ) {
+                status.phase = ConnectionPhase::Disconnected;
+                status.message = None;
             }
         }
     }
