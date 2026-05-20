@@ -115,9 +115,13 @@ impl SingBoxEngine {
         let config_text = serde_json::to_string_pretty(&config)
             .map_err(|error| VpnError::Engine(format!("failed to serialize config: {error}")))?;
         let config_path = write_runtime_config(app, &config_text)?;
-        let binary = resolve_core_binary(app)?;
 
-        check_config(&binary, &config_path).await?;
+        #[cfg(not(target_os = "macos"))]
+        {
+            let binary = resolve_core_binary(app)?;
+            check_config(&binary, &config_path).await?;
+        }
+
         #[cfg(target_os = "macos")]
         crate::macos_vpn::install_vpn_profile()?;
         cleanup_desktop_artifacts(&config_path).await?;
@@ -157,6 +161,7 @@ impl SingBoxEngine {
 
         #[cfg(not(target_os = "macos"))]
         {
+            let binary = resolve_core_binary(app)?;
             let mut command = Command::new(&binary);
             command.arg("run").arg("-c").arg(&config_path);
             command.kill_on_drop(true);
