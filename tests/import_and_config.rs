@@ -39,7 +39,10 @@ fn imports_trojan_uri() {
     let imported =
         import_server("trojan://test-password@example.com:443?security=tls&sni=example.com#Trojan")
             .unwrap();
-    assert_eq!(imported.profile.auth.password.as_deref(), Some("test-password"));
+    assert_eq!(
+        imported.profile.auth.password.as_deref(),
+        Some("test-password")
+    );
 }
 
 #[test]
