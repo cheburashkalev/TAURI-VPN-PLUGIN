@@ -121,6 +121,7 @@ impl SingBoxEngine {
         #[cfg(not(target_os = "macos"))]
         {
             let binary = resolve_core_binary(app)?;
+            ensure_linux_tun_permissions(&binary)?;
             check_config(&binary, &config_path).await?;
         }
 
@@ -1037,10 +1038,47 @@ fn hide_std_command_window(command: &mut std::process::Command) {
 #[allow(dead_code)]
 fn hide_std_command_window(_command: &mut std::process::Command) {}
 
+#[cfg(target_os = "linux")]
+fn ensure_linux_tun_permissions(binary: &Path) -> Result<()> {
+    let uid = std::process::Command::new("id")
+        .arg("-u")
+        .stdin(Stdio::null())
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|value| value.trim().parse::<u32>().ok());
+    if uid == Some(0) {
+        return Ok(());
+    }
+
+    let capabilities = std::process::Command::new("getcap")
+        .arg(binary)
+        .stdin(Stdio::null())
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .unwrap_or_default();
+
+    if capabilities.contains("cap_net_admin") {
+        return Ok(());
+    }
+
+    Err(VpnError::Platform(format!(
+        "Linux TUN mode requires CAP_NET_ADMIN on sing-box. Run: sudo setcap cap_net_admin,cap_net_raw+ep {}",
+        binary.display()
+    )))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ensure_linux_tun_permissions(_binary: &Path) -> Result<()> {
+    Ok(())
+}
+
 fn resolve_core_binary<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf> {
     let core_name = platform::default_core_name();
     let mut candidates = vec![
         std::env::var_os("KOSTRA_VPN_SING_BOX").map(PathBuf::from),
+        platform_development_core_candidate(core_name),
         app.path()
             .resolve(core_name, tauri::path::BaseDirectory::Resource)
             .ok(),
@@ -1087,6 +1125,18 @@ fn resolve_core_binary<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf> {
                 core_name
             ))
         })
+}
+
+#[cfg(target_os = "linux")]
+fn platform_development_core_candidate(core_name: &str) -> Option<PathBuf> {
+    std::env::current_dir()
+        .ok()
+        .map(|dir| dir.join("binaries").join("linux").join(core_name))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn platform_development_core_candidate(_core_name: &str) -> Option<PathBuf> {
+    None
 }
 
 fn add_ancestor_resource_candidates(

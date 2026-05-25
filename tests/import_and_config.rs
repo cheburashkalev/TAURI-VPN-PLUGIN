@@ -22,14 +22,14 @@ fn imports_vless_reality_uri() {
 }
 
 #[test]
-fn imports_real_3x_ui_vless_reality_grpc_uri() {
-    let imported = import_server("vless://4f3d5e71-cca2-40f2-a64a-b81ced26db3a@80.76.43.249:13979?type=grpc&encryption=none&security=reality&sni=www.oracle.com&fp=chrome&pbk=9WSPT5_GkOSL_A0G_HLQCcF0XbBTjvznLMefmpNsUWs&sid=2708a83155a0d13b&spx=%2F#-user_Cheburashka_lev_192c7").unwrap();
-    assert_eq!(imported.profile.name, "-user_Cheburashka_lev_192c7");
-    assert_eq!(imported.profile.server, "80.76.43.249");
+fn imports_3x_ui_vless_reality_grpc_uri() {
+    let imported = import_server("vless://22222222-2222-4222-8222-222222222222@example.com:13979?type=grpc&encryption=none&security=reality&sni=www.example.com&fp=chrome&pbk=TEST_PUBLIC_KEY&sid=01020304&spx=%2F#Reality%20gRPC").unwrap();
+    assert_eq!(imported.profile.name, "Reality gRPC");
+    assert_eq!(imported.profile.server, "example.com");
     assert_eq!(imported.profile.port, 13979);
     assert_eq!(
         imported.profile.auth.uuid.as_deref(),
-        Some("4f3d5e71-cca2-40f2-a64a-b81ced26db3a")
+        Some("22222222-2222-4222-8222-222222222222")
     );
     assert!(imported.profile.reality.is_some());
 }
@@ -37,9 +37,12 @@ fn imports_real_3x_ui_vless_reality_grpc_uri() {
 #[test]
 fn imports_trojan_uri() {
     let imported =
-        import_server("trojan://secret@example.com:443?security=tls&sni=example.com#Trojan")
+        import_server("trojan://test-password@example.com:443?security=tls&sni=example.com#Trojan")
             .unwrap();
-    assert_eq!(imported.profile.auth.password.as_deref(), Some("secret"));
+    assert_eq!(
+        imported.profile.auth.password.as_deref(),
+        Some("test-password")
+    );
 }
 
 #[test]
