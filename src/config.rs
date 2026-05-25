@@ -38,7 +38,7 @@ pub fn generate_sing_box_config(options: &ConnectOptions) -> Result<Value> {
     let inbounds = vec![json!({
         "type": "tun",
         "tag": "tun-in",
-        "address": ["198.18.0.1/30"],
+        "address": ["198.18.0.1/30", "fdfe:dcba:9876::1/126"],
         "mtu": tun_mtu,
         "route_exclude_address": LOCAL_NETWORK_CIDRS,
         "auto_route": true,
@@ -59,6 +59,17 @@ pub fn generate_sing_box_config(options: &ConnectOptions) -> Result<Value> {
         "listen_port": 2080
     }));
 
+    let mut route = json!({
+        "rules": route_rules,
+        "default_domain_resolver": "dns-bootstrap",
+        "final": route_final
+    });
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        route["auto_detect_interface"] = json!(true);
+    }
+
     Ok(json!({
         "log": {
             "level": "info",
@@ -75,12 +86,7 @@ pub fn generate_sing_box_config(options: &ConnectOptions) -> Result<Value> {
             { "type": "direct", "tag": "direct" },
             { "type": "block", "tag": "block" }
         ],
-        "route": {
-            "rules": route_rules,
-            "auto_detect_interface": true,
-            "default_domain_resolver": "dns-bootstrap",
-            "final": route_final
-        },
+        "route": route,
         "experimental": {
             "clash_api": {
                 "external_controller": CLASH_API_ADDR

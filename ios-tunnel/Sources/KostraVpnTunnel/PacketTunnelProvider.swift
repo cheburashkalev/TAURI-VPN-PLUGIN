@@ -216,7 +216,7 @@ private final class TunnelPlatformInterface: NSObject, LibboxPlatformInterfacePr
   }
 
   func includeAllNetworks() -> Bool {
-    false
+    true
   }
 
   func localDNSTransport() -> LibboxLocalDNSTransportProtocol? {
@@ -371,6 +371,9 @@ private final class TunnelPlatformInterface: NSObject, LibboxPlatformInterfacePr
         let ipv4Settings = NEIPv4Settings(addresses: ipv4Addresses, subnetMasks: ipv4Masks)
         ipv4Settings.includedRoutes = routes(iterator: options.getInet4RouteAddress(), defaultRoute: NEIPv4Route.default())
         ipv4Settings.excludedRoutes = routes(iterator: options.getInet4RouteExcludeAddress())
+        TunnelDebug.log(
+          "ipv4 settings addresses=\(ipv4Addresses.joined(separator: ",")) includedRoutes=\(ipv4Settings.includedRoutes?.count ?? 0) excludedRoutes=\(ipv4Settings.excludedRoutes?.count ?? 0)"
+        )
         settings.ipv4Settings = ipv4Settings
       }
 
@@ -389,6 +392,9 @@ private final class TunnelPlatformInterface: NSObject, LibboxPlatformInterfacePr
         let ipv6Settings = NEIPv6Settings(addresses: ipv6Addresses, networkPrefixLengths: ipv6Prefixes)
         ipv6Settings.includedRoutes = routes6(iterator: options.getInet6RouteAddress(), defaultRoute: NEIPv6Route.default())
         ipv6Settings.excludedRoutes = routes6(iterator: options.getInet6RouteExcludeAddress())
+        TunnelDebug.log(
+          "ipv6 settings addresses=\(ipv6Addresses.joined(separator: ",")) includedRoutes=\(ipv6Settings.includedRoutes?.count ?? 0) excludedRoutes=\(ipv6Settings.excludedRoutes?.count ?? 0)"
+        )
         settings.ipv6Settings = ipv6Settings
       }
     }

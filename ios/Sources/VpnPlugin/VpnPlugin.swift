@@ -45,6 +45,7 @@ struct StatusPayload: Encodable {
           "activeProfileId": args.profileId ?? "",
           "configContent": args.configJson
         ]
+        self.applyPacketTunnelPreferences(to: manager.protocolConfiguration)
         manager.saveToPreferences { error in
           if let error {
             invoke.reject("failed to save VPN preferences: \(error.localizedDescription)", code: "IOS_VPN_SAVE")
@@ -130,9 +131,24 @@ struct StatusPayload: Encodable {
       protocolConfiguration.providerBundleIdentifier = self.packetTunnelBundleIdentifier()
       protocolConfiguration.serverAddress = "KOSTRA VPN"
       manager.protocolConfiguration = protocolConfiguration
+      applyPacketTunnelPreferences(to: protocolConfiguration)
       manager.localizedDescription = self.tunnelDescription
       manager.isEnabled = true
       completion(.success(manager))
+    }
+  }
+
+  private func applyPacketTunnelPreferences(to configuration: NEVPNProtocol?) {
+    guard let configuration else { return }
+    configuration.includeAllNetworks = true
+    configuration.excludeLocalNetworks = true
+    configuration.enforceRoutes = false
+    if #available(iOS 16.4, *) {
+      configuration.excludeAPNs = true
+      configuration.excludeCellularServices = true
+    }
+    if #available(iOS 17.4, *) {
+      configuration.excludeDeviceCommunication = true
     }
   }
 }
