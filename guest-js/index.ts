@@ -79,6 +79,7 @@ export interface DnsOptions {
 export interface ConnectOptions {
   profile: VpnProfile;
   routeMode?: RouteMode;
+  routeBypassCidrs?: string[];
   dns?: DnsOptions;
   killSwitch?: boolean;
 }

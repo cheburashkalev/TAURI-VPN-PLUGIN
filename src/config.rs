@@ -31,7 +31,7 @@ pub fn generate_sing_box_config(options: &ConnectOptions) -> Result<Value> {
     let route_final = match options.route_mode {
         RouteMode::Global | RouteMode::Rule => "proxy",
     };
-    let route_rules = route_rules_for_profile(&options.profile);
+    let route_rules = route_rules_for_profile(&options.profile, &options.route_bypass_cidrs);
     let tun_stack = tun_stack_for_profile(&options.profile);
     let tun_mtu = tun_mtu_for_profile(&options.profile);
     let dns_servers = dns_servers_for_options(options);
@@ -178,7 +178,7 @@ fn dns_strategy(strategy: DnsStrategy) -> &'static str {
     }
 }
 
-fn route_rules_for_profile(profile: &VpnProfile) -> Vec<Value> {
+fn route_rules_for_profile(profile: &VpnProfile, route_bypass_cidrs: &[String]) -> Vec<Value> {
     let mut rules = vec![
         json!({
             "protocol": "dns",
@@ -195,6 +195,19 @@ fn route_rules_for_profile(profile: &VpnProfile) -> Vec<Value> {
             "outbound": "direct"
         }),
     ];
+
+    let route_bypass_cidrs: Vec<&str> = route_bypass_cidrs
+        .iter()
+        .map(|cidr| cidr.trim())
+        .filter(|cidr| !cidr.is_empty())
+        .collect();
+    if !route_bypass_cidrs.is_empty() {
+        rules.push(json!({
+            "ip_cidr": route_bypass_cidrs,
+            "action": "route",
+            "outbound": "direct"
+        }));
+    }
 
     rules.extend([
         json!({

@@ -169,6 +169,8 @@ pub struct ConnectOptions {
     #[serde(default)]
     pub route_mode: RouteMode,
     #[serde(default)]
+    pub route_bypass_cidrs: Vec<String>,
+    #[serde(default)]
     pub dns: DnsOptions,
     #[serde(default)]
     pub kill_switch: bool,
