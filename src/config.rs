@@ -1,5 +1,5 @@
 use crate::{
-    models::{ConnectOptions, DnsStrategy, RouteMode, TransportKind, VpnProfile, VpnProtocol},
+    models::{ConnectOptions, RouteMode, TransportKind, VpnProfile, VpnProtocol},
     olcrtc, protocols, Result, VpnError,
 };
 use serde_json::{json, Value};
@@ -15,10 +15,6 @@ const LOCAL_NETWORK_CIDRS: &[&str] = &[
     "192.168.0.0/16",
     "224.0.0.0/4",
     "255.255.255.255/32",
-    "::1/128",
-    "fc00::/7",
-    "fe80::/10",
-    "ff00::/8",
 ];
 
 pub fn generate_sing_box_config(options: &ConnectOptions) -> Result<Value> {
@@ -38,7 +34,7 @@ pub fn generate_sing_box_config(options: &ConnectOptions) -> Result<Value> {
     let inbounds = vec![json!({
         "type": "tun",
         "tag": "tun-in",
-        "address": ["198.18.0.1/30", "fdfe:dcba:9876::1/126"],
+        "address": ["198.18.0.1/30"],
         "mtu": tun_mtu,
         "route_exclude_address": LOCAL_NETWORK_CIDRS,
         "auto_route": true,
@@ -77,7 +73,7 @@ pub fn generate_sing_box_config(options: &ConnectOptions) -> Result<Value> {
         },
         "dns": {
             "servers": dns_servers,
-            "strategy": dns_strategy(options.dns.strategy),
+            "strategy": "ipv4_only",
             "final": "dns-0"
         },
         "inbounds": inbounds,
@@ -104,7 +100,7 @@ fn dns_servers_for_options(options: &ConnectOptions) -> Vec<Value> {
             .servers
             .iter()
             .map(|server| server.trim().to_string())
-            .filter(|server| !server.is_empty())
+            .filter(|server| !server.is_empty() && !server.contains(':'))
             .collect()
     };
     let bootstrap = upstreams
@@ -158,23 +154,10 @@ fn dns_server_for_upstream(index: usize, server: &str) -> Value {
 
 fn public_doh_server_name(server: &str) -> Option<&'static str> {
     match server {
-        "1.1.1.1" | "1.0.0.1" | "2606:4700:4700::1111" | "2606:4700:4700::1001" => {
-            Some("cloudflare-dns.com")
-        }
-        "8.8.8.8" | "8.8.4.4" | "2001:4860:4860::8888" | "2001:4860:4860::8844" => {
-            Some("dns.google")
-        }
-        "9.9.9.9" | "149.112.112.112" | "2620:fe::fe" | "2620:fe::9" => Some("dns.quad9.net"),
+        "1.1.1.1" | "1.0.0.1" => Some("cloudflare-dns.com"),
+        "8.8.8.8" | "8.8.4.4" => Some("dns.google"),
+        "9.9.9.9" | "149.112.112.112" => Some("dns.quad9.net"),
         _ => None,
-    }
-}
-
-fn dns_strategy(strategy: DnsStrategy) -> &'static str {
-    match strategy {
-        DnsStrategy::Ipv4Only => "ipv4_only",
-        DnsStrategy::Ipv6Only => "ipv6_only",
-        DnsStrategy::PreferIpv4 => "prefer_ipv4",
-        DnsStrategy::PreferIpv6 => "prefer_ipv6",
     }
 }
 
@@ -321,6 +304,12 @@ fn outbound_for_profile(profile: &VpnProfile) -> Result<Value> {
                 .wireguard
                 .as_ref()
                 .ok_or_else(|| VpnError::InvalidProfile("wireGuard options are required".into()))?;
+            let local_address = ipv4_only_cidrs(&wg.local_address);
+            if local_address.is_empty() {
+                return Err(VpnError::InvalidProfile(
+                    "wireGuard local_address must contain an IPv4 address".into(),
+                ));
+            }
             json!({
                 "type": "wireguard",
                 "tag": "proxy",
@@ -329,7 +318,7 @@ fn outbound_for_profile(profile: &VpnProfile) -> Result<Value> {
                 "private_key": wg.private_key,
                 "peer_public_key": wg.peer_public_key,
                 "pre_shared_key": wg.pre_shared_key,
-                "local_address": wg.local_address,
+                "local_address": local_address,
                 "reserved": wg.reserved
             })
         }
@@ -472,6 +461,15 @@ fn strip_nulls(mut value: Value) -> Value {
         map.retain(|_, item| !item.is_null());
     }
     value
+}
+
+fn ipv4_only_cidrs(values: &[String]) -> Vec<String> {
+    values
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty() && !value.contains(':'))
+        .map(str::to_string)
+        .collect()
 }
 
 fn add_transport(profile: &VpnProfile, outbound: &mut Value) {
