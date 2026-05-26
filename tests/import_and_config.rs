@@ -8,6 +8,7 @@ fn options(input: &str) -> ConnectOptions {
     ConnectOptions {
         profile: import_server(input).unwrap().profile,
         route_mode: RouteMode::Global,
+        route_bypass_cidrs: Vec::new(),
         dns: DnsOptions::default(),
         kill_switch: true,
     }
