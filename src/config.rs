@@ -239,7 +239,11 @@ fn route_rules_for_profile(profile: &VpnProfile, route_bypass_cidrs: &[String]) 
 }
 
 fn tun_stack_for_profile(profile: &VpnProfile) -> &'static str {
-    if cfg!(any(target_os = "android", target_os = "ios")) {
+    if cfg!(any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "macos"
+    )) {
         return "gvisor";
     }
 
