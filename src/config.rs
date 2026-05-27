@@ -27,10 +27,15 @@ pub fn generate_sing_box_config(options: &ConnectOptions) -> Result<Value> {
     let route_final = match options.route_mode {
         RouteMode::Global | RouteMode::Rule => "proxy",
     };
-    let route_rules = route_rules_for_profile(&options.profile, &options.route_bypass_cidrs);
+    let dns_upstreams = dns_upstreams_for_options(options);
+    let route_rules = route_rules_for_profile(
+        &options.profile,
+        &options.route_bypass_cidrs,
+        &dns_upstreams,
+    );
     let tun_stack = tun_stack_for_profile(&options.profile);
     let tun_mtu = tun_mtu_for_profile(&options.profile);
-    let dns_servers = dns_servers_for_options(options);
+    let dns_servers = dns_servers_for_upstreams(&dns_upstreams);
     let inbounds = vec![json!({
         "type": "tun",
         "tag": "tun-in",
@@ -55,16 +60,12 @@ pub fn generate_sing_box_config(options: &ConnectOptions) -> Result<Value> {
         "listen_port": 2080
     }));
 
-    let mut route = json!({
+    let route = json!({
         "rules": route_rules,
         "default_domain_resolver": "dns-bootstrap",
-        "final": route_final
+        "final": route_final,
+        "auto_detect_interface": true
     });
-
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    {
-        route["auto_detect_interface"] = json!(true);
-    }
 
     Ok(json!({
         "log": {
@@ -91,25 +92,30 @@ pub fn generate_sing_box_config(options: &ConnectOptions) -> Result<Value> {
     }))
 }
 
-fn dns_servers_for_options(options: &ConnectOptions) -> Vec<Value> {
-    let upstreams = if options.dns.servers.is_empty() {
-        vec!["1.1.1.1".to_string()]
+fn dns_upstreams_for_options(options: &ConnectOptions) -> Vec<String> {
+    let upstreams: Vec<String> = options
+        .dns
+        .servers
+        .iter()
+        .map(|server| server.trim().to_string())
+        .filter(|server| !server.is_empty() && !server.contains(':'))
+        .collect();
+
+    if upstreams.is_empty() {
+        vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()]
     } else {
-        options
-            .dns
-            .servers
-            .iter()
-            .map(|server| server.trim().to_string())
-            .filter(|server| !server.is_empty() && !server.contains(':'))
-            .collect()
-    };
+        upstreams
+    }
+}
+
+fn dns_servers_for_upstreams(upstreams: &[String]) -> Vec<Value> {
     let bootstrap = upstreams
         .first()
         .cloned()
         .unwrap_or_else(|| "1.1.1.1".to_string());
 
     let mut servers = vec![json!({
-        "type": "tcp",
+        "type": "udp",
         "tag": "dns-bootstrap",
         "server": bootstrap,
         "server_port": 53
@@ -161,8 +167,28 @@ fn public_doh_server_name(server: &str) -> Option<&'static str> {
     }
 }
 
-fn route_rules_for_profile(profile: &VpnProfile, route_bypass_cidrs: &[String]) -> Vec<Value> {
-    let mut rules = vec![
+fn route_rules_for_profile(
+    profile: &VpnProfile,
+    route_bypass_cidrs: &[String],
+    _dns_upstreams: &[String],
+) -> Vec<Value> {
+    let mut rules = Vec::new();
+
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        let dns_upstream_cidrs = ipv4_only_host_cidrs(_dns_upstreams);
+        if !dns_upstream_cidrs.is_empty() {
+            rules.push(json!({
+                "ip_cidr": dns_upstream_cidrs,
+                "network": ["tcp", "udp"],
+                "port": 53,
+                "action": "route",
+                "outbound": "direct"
+            }));
+        }
+    }
+
+    rules.extend([
         json!({
             "protocol": "dns",
             "action": "hijack-dns"
@@ -177,7 +203,7 @@ fn route_rules_for_profile(profile: &VpnProfile, route_bypass_cidrs: &[String]) 
             "action": "route",
             "outbound": "direct"
         }),
-    ];
+    ]);
 
     let route_bypass_cidrs: Vec<&str> = route_bypass_cidrs
         .iter()
@@ -473,6 +499,22 @@ fn ipv4_only_cidrs(values: &[String]) -> Vec<String> {
         .map(|value| value.trim())
         .filter(|value| !value.is_empty() && !value.contains(':'))
         .map(str::to_string)
+        .collect()
+}
+
+#[cfg(any(target_os = "android", target_os = "ios"))]
+fn ipv4_only_host_cidrs(values: &[String]) -> Vec<String> {
+    values
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty() && !value.contains(':'))
+        .map(|value| {
+            if value.contains('/') {
+                value.to_string()
+            } else {
+                format!("{value}/32")
+            }
+        })
         .collect()
 }
 

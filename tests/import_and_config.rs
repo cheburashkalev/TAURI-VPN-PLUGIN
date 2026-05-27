@@ -1,7 +1,7 @@
 use tauri_plugin_vpn::{
     config::generate_sing_box_config,
     import::import_server,
-    models::{ConnectOptions, DnsOptions, RouteMode},
+    models::{ConnectOptions, DnsOptions, DnsStrategy, RouteMode},
 };
 
 fn options(input: &str) -> ConnectOptions {
@@ -57,6 +57,7 @@ fn generates_sing_box_config() {
     let config = generate_sing_box_config(&options("vless://11111111-1111-1111-1111-111111111111@example.com:443?security=tls&sni=example.com#Node")).unwrap();
     assert_eq!(config["outbounds"][0]["type"], "vless");
     assert_eq!(config["inbounds"][0]["type"], "tun");
+    assert_eq!(config["route"]["auto_detect_interface"], true);
 }
 
 #[test]
@@ -78,6 +79,36 @@ fn generates_doh_dns_for_public_resolvers() {
     assert_eq!(cloudflare["tls"]["server_name"], "cloudflare-dns.com");
     assert_eq!(google["type"], "https");
     assert_eq!(google["tls"]["server_name"], "dns.google");
+}
+
+#[test]
+fn keeps_bootstrap_dns_direct() {
+    let config = generate_sing_box_config(&options("vless://11111111-1111-1111-1111-111111111111@example.com:443?security=tls&sni=example.com#Node")).unwrap();
+    let servers = config["dns"]["servers"].as_array().unwrap();
+    let bootstrap = servers
+        .iter()
+        .find(|server| server["tag"] == "dns-bootstrap")
+        .unwrap();
+
+    assert_eq!(bootstrap["type"], "udp");
+    assert_eq!(bootstrap["server"], "1.1.1.1");
+    assert!(bootstrap.get("detour").is_none());
+}
+
+#[test]
+fn falls_back_to_ipv4_dns_when_configured_servers_are_ipv6_only() {
+    let mut options = options("vless://11111111-1111-1111-1111-111111111111@example.com:443?security=tls&sni=example.com#Node");
+    options.dns = DnsOptions {
+        strategy: DnsStrategy::Ipv6Only,
+        servers: vec!["2606:4700:4700::1111".into()],
+    };
+
+    let config = generate_sing_box_config(&options).unwrap();
+    let servers = config["dns"]["servers"].as_array().unwrap();
+
+    assert_eq!(config["dns"]["strategy"], "ipv4_only");
+    assert!(servers.iter().any(|server| server["tag"] == "dns-0"));
+    assert!(servers.iter().any(|server| server["server"] == "1.1.1.1"));
 }
 
 #[test]
