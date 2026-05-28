@@ -50,6 +50,50 @@ generate a sing-box SOCKS outbound that points to that local endpoint.
 Desktop builds must package a `sing-box` binary as a Tauri resource. iOS builds
 require Apple Developer NetworkExtension entitlements and a Packet Tunnel target.
 
+## Runtime behavior
+
+Desktop platforms run the bundled `sing-box` binary with a generated runtime
+config stored as `sing-box.generated.json` under Tauri's app-local data
+directory. `stdout` and `stderr` from the child process are forwarded to the app
+as `vpn:log` events, so startup failures such as `sing-box exited during startup`
+must be diagnosed from those VPN logs.
+
+On Windows, the `sing-box.exe` child process is attached to a Windows Job Object
+with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. This keeps the process tied to the app
+lifetime more reliably than a normal child process: if the app exits or crashes,
+closing the Job Object handle asks Windows to terminate the assigned `sing-box`
+process. The plugin still performs normal cleanup on disconnect and startup to
+remove stale TUN state and old `sing-box` instances that used the same generated
+config path.
+
+On Linux, TUN mode requires `CAP_NET_ADMIN` and `CAP_NET_RAW` on the packaged
+`sing-box` binary. The plugin checks capabilities and reports the `setcap`
+command when they are missing.
+
+On macOS, the plugin uses the system NetworkExtension path. When privileged
+`sing-box` startup is used, its log is written next to the generated config as
+`sing-box.macos.log` and tailed into the error details.
+
+Android and iOS use native tunnel integrations backed by `libbox` /
+NetworkExtension instead of spawning a desktop child process.
+
+## Routing and DNS
+
+Generated configs currently use an IPv4-only TUN address and force sing-box DNS
+strategy to `ipv4_only`. IPv6 DNS upstreams are filtered out; when no IPv4 DNS
+server remains, the plugin falls back to `1.1.1.1` and `8.8.8.8`.
+
+The TUN inbound uses `auto_route` and excludes common local/private networks.
+Additional route-bypass CIDRs supplied by the app are emitted as direct route
+rules. On Android and iOS, bootstrap DNS upstreams are direct-routed before DNS
+hijack rules so sing-box DNS bootstrap traffic does not loop back into the
+tunnel.
+
+The generated route config enables `auto_detect_interface` on all desktop and
+mobile targets. This is required for direct outbound traffic to use the real
+network interface; on Android it also allows the native platform interface to
+protect direct sockets from the VPN tunnel.
+
 Keep these files in version control for reproducible builds on another machine:
 
 - `package-lock.json`

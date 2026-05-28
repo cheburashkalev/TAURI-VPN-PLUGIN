@@ -29,6 +29,23 @@ use tokio::{
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
+#[cfg(target_os = "windows")]
+struct WindowsJob {
+    handle: windows::Win32::Foundation::HANDLE,
+}
+
+#[cfg(target_os = "windows")]
+unsafe impl Send for WindowsJob {}
+
+#[cfg(target_os = "windows")]
+impl Drop for WindowsJob {
+    fn drop(&mut self) {
+        if !self.handle.is_invalid() {
+            let _ = unsafe { windows::Win32::Foundation::CloseHandle(self.handle) };
+        }
+    }
+}
+
 const CONFIG_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 const DESKTOP_STOP_TIMEOUT: Duration = Duration::from_secs(8);
 const DESKTOP_STATS_TIMEOUT: Duration = Duration::from_secs(3);
@@ -42,6 +59,8 @@ const MOBILE_SYSTEM_TUNNEL_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub struct SingBoxEngine {
     child: Mutex<Option<Child>>,
+    #[cfg(target_os = "windows")]
+    windows_job: Mutex<Option<WindowsJob>>,
     #[cfg(target_os = "macos")]
     privileged_pid: Mutex<Option<u32>>,
     #[cfg(target_os = "macos")]
@@ -57,6 +76,8 @@ impl Default for SingBoxEngine {
     fn default() -> Self {
         Self {
             child: Mutex::new(None),
+            #[cfg(target_os = "windows")]
+            windows_job: Mutex::new(None),
             #[cfg(target_os = "macos")]
             privileged_pid: Mutex::new(None),
             #[cfg(target_os = "macos")]
@@ -179,9 +200,26 @@ impl SingBoxEngine {
                 Ok(mut child) => {
                     pipe_logs(app, child.stdout.take(), "stdout");
                     pipe_logs(app, child.stderr.take(), "stderr");
+                    #[cfg(target_os = "windows")]
+                    match assign_child_to_windows_job(&child) {
+                        Ok(job) => {
+                            *self.windows_job.lock().await = Some(job);
+                            let _ = app.emit("vpn:log", "sing-box attached to Windows job object");
+                        }
+                        Err(error) => {
+                            let _ = app.emit(
+                                "vpn:log",
+                                format!("failed to attach sing-box to Windows job object: {error}"),
+                            );
+                        }
+                    }
                     if let Some(status) = wait_for_desktop_readiness(&mut child).await? {
                         if let Some(runtime) = olcrtc_runtime.take() {
                             runtime.stop().await;
+                        }
+                        #[cfg(target_os = "windows")]
+                        {
+                            let _ = self.windows_job.lock().await.take();
                         }
                         let _ = cleanup_desktop_artifacts(&config_path).await;
                         return Err(VpnError::Engine(format!(
@@ -351,6 +389,10 @@ impl SingBoxEngine {
             }
         }
         let Some(mut child) = guard.take() else {
+            #[cfg(target_os = "windows")]
+            {
+                let _ = self.windows_job.lock().await.take();
+            }
             cleanup_desktop_artifacts(&runtime_config_path(app)?).await?;
             return Err(VpnError::NotRunning);
         };
@@ -361,10 +403,18 @@ impl SingBoxEngine {
             runtime.stop().await;
         }
         if let Err(error) = kill_result {
+            #[cfg(target_os = "windows")]
+            {
+                let _ = self.windows_job.lock().await.take();
+            }
             let _ = cleanup_desktop_artifacts(&runtime_config_path(app)?).await;
             return Err(VpnError::Engine(format!(
                 "failed to stop sing-box: {error}"
             )));
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let _ = self.windows_job.lock().await.take();
         }
         cleanup_desktop_artifacts(&runtime_config_path(app)?).await?;
         let _ = app.emit("vpn:log", "sing-box process stopped");
@@ -643,6 +693,50 @@ async fn wait_for_desktop_readiness(child: &mut Child) -> Result<Option<std::pro
     Err(VpnError::Engine(
         "sing-box did not open local proxy ports during startup".into(),
     ))
+}
+
+#[cfg(target_os = "windows")]
+fn assign_child_to_windows_job(child: &Child) -> Result<WindowsJob> {
+    use windows::{
+        core::PCWSTR,
+        Win32::System::{
+            JobObjects::{
+                AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
+                JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            },
+            Threading::{OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE},
+        },
+    };
+
+    let pid = child
+        .id()
+        .ok_or_else(|| VpnError::Engine("sing-box process id unavailable".into()))?;
+
+    let job = unsafe { CreateJobObjectW(None, PCWSTR::null()) }
+        .map(|handle| WindowsJob { handle })
+        .map_err(|error| VpnError::Engine(format!("CreateJobObjectW failed: {error}")))?;
+
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    unsafe {
+        SetInformationJobObject(
+            job.handle,
+            JobObjectExtendedLimitInformation,
+            &limits as *const _ as *const core::ffi::c_void,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    }
+    .map_err(|error| VpnError::Engine(format!("SetInformationJobObject failed: {error}")))?;
+
+    let process = unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, false, pid) }
+        .map_err(|error| VpnError::Engine(format!("OpenProcess failed: {error}")))?;
+    let assign_result = unsafe { AssignProcessToJobObject(job.handle, process) };
+    let _ = unsafe { windows::Win32::Foundation::CloseHandle(process) };
+    assign_result
+        .map_err(|error| VpnError::Engine(format!("AssignProcessToJobObject failed: {error}")))?;
+
+    Ok(job)
 }
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
