@@ -140,7 +140,7 @@ struct StatusPayload: Encodable {
 
   private func applyPacketTunnelPreferences(to configuration: NEVPNProtocol?) {
     guard let configuration else { return }
-    configuration.includeAllNetworks = true
+    configuration.includeAllNetworks = false
     configuration.excludeLocalNetworks = true
     configuration.enforceRoutes = false
     if #available(iOS 16.4, *) {

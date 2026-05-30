@@ -216,7 +216,7 @@ private final class TunnelPlatformInterface: NSObject, LibboxPlatformInterfacePr
   }
 
   func includeAllNetworks() -> Bool {
-    true
+    false
   }
 
   func localDNSTransport() -> LibboxLocalDNSTransportProtocol? {

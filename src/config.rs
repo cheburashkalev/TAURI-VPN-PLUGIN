@@ -35,11 +35,13 @@ pub fn generate_sing_box_config(options: &ConnectOptions) -> Result<Value> {
     );
     let tun_stack = tun_stack_for_profile(&options.profile);
     let tun_mtu = tun_mtu_for_profile(&options.profile);
+    let tun_address = tun_address();
+    let dns_strategy = dns_strategy();
     let dns_servers = dns_servers_for_upstreams(&dns_upstreams);
     let inbounds = vec![json!({
         "type": "tun",
         "tag": "tun-in",
-        "address": ["198.18.0.1/30"],
+        "address": tun_address,
         "mtu": tun_mtu,
         "route_exclude_address": LOCAL_NETWORK_CIDRS,
         "auto_route": true,
@@ -74,7 +76,7 @@ pub fn generate_sing_box_config(options: &ConnectOptions) -> Result<Value> {
         },
         "dns": {
             "servers": dns_servers,
-            "strategy": "ipv4_only",
+            "strategy": dns_strategy,
             "final": "dns-0"
         },
         "inbounds": inbounds,
@@ -90,6 +92,30 @@ pub fn generate_sing_box_config(options: &ConnectOptions) -> Result<Value> {
             }
         }
     }))
+}
+
+fn tun_address() -> &'static [&'static str] {
+    #[cfg(target_os = "ios")]
+    {
+        return &["198.18.0.1/30", "fdfe:dcba:9876::1/126"];
+    }
+
+    #[cfg(not(target_os = "ios"))]
+    {
+        &["198.18.0.1/30"]
+    }
+}
+
+fn dns_strategy() -> &'static str {
+    #[cfg(target_os = "ios")]
+    {
+        return "prefer_ipv4";
+    }
+
+    #[cfg(not(target_os = "ios"))]
+    {
+        "ipv4_only"
+    }
 }
 
 fn dns_upstreams_for_options(options: &ConnectOptions) -> Vec<String> {

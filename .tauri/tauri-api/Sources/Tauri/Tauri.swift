@@ -17,11 +17,70 @@ class PluginHandle {
   }
 }
 
+private final class WebviewRecovery {
+  private weak var webview: WKWebView?
+  private var didEnterBackgroundObserver: NSObjectProtocol?
+  private var didBecomeActiveObserver: NSObjectProtocol?
+  private var shouldReloadOnActive = false
+
+  init(webview: WKWebView) {
+    self.webview = webview
+
+    didEnterBackgroundObserver = NotificationCenter.default.addObserver(
+      forName: UIApplication.didEnterBackgroundNotification,
+      object: nil,
+      queue: .main
+    ) { [weak self] _ in
+      self?.shouldReloadOnActive = true
+    }
+
+    didBecomeActiveObserver = NotificationCenter.default.addObserver(
+      forName: UIApplication.didBecomeActiveNotification,
+      object: nil,
+      queue: .main
+    ) { [weak self] _ in
+      self?.recoverIfNeeded()
+    }
+  }
+
+  deinit {
+    if let didEnterBackgroundObserver = didEnterBackgroundObserver {
+      NotificationCenter.default.removeObserver(didEnterBackgroundObserver)
+    }
+    if let didBecomeActiveObserver = didBecomeActiveObserver {
+      NotificationCenter.default.removeObserver(didBecomeActiveObserver)
+    }
+  }
+
+  private func recoverIfNeeded() {
+    guard shouldReloadOnActive, let webview = webview else {
+      return
+    }
+
+    shouldReloadOnActive = false
+    DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(150)) { [weak webview] in
+      guard let webview = webview else {
+        return
+      }
+
+      webview.setNeedsLayout()
+      webview.scrollView.setNeedsLayout()
+      webview.scrollView.layoutIfNeeded()
+
+      if webview.url != nil {
+        os_log("Reloading WKWebView after foreground to recover terminated WebContent")
+        webview.reload()
+      }
+    }
+  }
+}
+
 public class PluginManager {
   static let shared: PluginManager = PluginManager()
   public var viewController: UIViewController?
   var plugins: [String: PluginHandle] = [:]
   var ipcDispatchQueue = DispatchQueue(label: "ipc")
+  private var webviewRecovery: WebviewRecovery?
   public var isSimEnvironment: Bool {
     #if targetEnvironment(simulator)
       return true
@@ -39,6 +98,8 @@ public class PluginManager {
   }
 
   func onWebviewCreated(_ webview: WKWebView) {
+    webviewRecovery = WebviewRecovery(webview: webview)
+
     for (_, handle) in plugins {
       if !handle.loaded {
         handle.instance.load(webview: webview)
